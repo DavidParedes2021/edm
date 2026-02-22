@@ -55,19 +55,19 @@ Run: python edm_t04_020226_1430_server.py
 # =====================================================
 # CONFIGURATION — Edit these paths before running
 # =====================================================
-
 # Root folder of the Endo4IE dataset (synced via gdown)
-DATASET_PATH = "/home/user/data/endo4ie"          # <-- EDIT THIS
+#DATASET_PATH = "./"          # <-- EDIT THIS
+DATASET_PATH = "../../data/datasets/endo4ie/"
 
 # Where to save models, checkpoints and samples
-OUTPUT_BASE  = "/home/user/outputs/endo_diffusion" # <-- EDIT THIS
+#OUTPUT_BASE  = "./endo_diffusion/output/" # <-- EDIT THIS
+OUTPUT_BASE = "../edm_outputs/edm_t04/"
 
 # Synthetic dataset output folder
-SYNTHETIC_OUTPUT = "/home/user/outputs/synthetic_datasets" # <-- EDIT THIS
+SYNTHETIC_OUTPUT = "../edm_outputs/edm_t04/synthetic_datasets" # <-- EDIT THIS
 
 # Weights & Biases project name (set to None to disable W&B)
-WANDB_PROJECT = "endo-artifact-generation"        # <-- EDIT or set None
-
+WANDB_PROJECT = "endo-artifact-generation"   
 # =====================================================
 # Imports
 # =====================================================
