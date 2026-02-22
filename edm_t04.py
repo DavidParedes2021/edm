@@ -285,6 +285,9 @@ def generate_and_save_samples(model, noise_scheduler, dataloader, output_dir,
     device = next(model.parameters()).device
 
     batch = next(iter(dataloader))
+    # Clamp num_samples to actual batch size to avoid index-out-of-bounds
+    # when batch_size < num_samples (e.g. batch_size=2, num_samples=4)
+    num_samples = min(num_samples, batch['normal'].shape[0])
     normal_imgs   = batch['normal'][:num_samples].to(device)
     real_artifacts = batch['artifact'][:num_samples].to(device)
 
