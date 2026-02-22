@@ -416,7 +416,11 @@ def train_conditional_diffusion(
                 noise_pred = model(noisy_artifacts, timesteps, normal_imgs)
                 loss       = F.mse_loss(noise_pred, noise)
                 accelerator.backward(loss)
-                accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                # clip_grad_norm_ must only be called on actual update steps
+                # (not on accumulation steps), otherwise the fp16 GradScaler
+                # raises "unscale_() has already been called since last update".
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
