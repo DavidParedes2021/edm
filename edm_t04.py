@@ -1,6 +1,54 @@
 """
-Conditional Artifact Diffusion Model — Server Version
-Environment: DGX Ubuntu server (no Google Colab, no display)
+Conditional Artifact Diffusion Model — DGX Server Version
+==========================================================
+Environment: Shared DGX Ubuntu, NVIDIA Driver 465.19.01, CUDA 11.3
+Docker image: pytorch/pytorch:1.11.0-cuda11.3-cudnn8-runtime
+Python: 3.8
+
+PINNED DEPENDENCY VERSIONS (install exactly these):
+----------------------------------------------------
+# PyTorch stack — already in the Docker image, do NOT reinstall unless needed
+  torch==1.11.0+cu113          (pre-installed)
+  torchvision==0.12.0+cu113   (pre-installed)
+  torchaudio==0.11.0           (pre-installed)
+
+# Install the rest inside the container:
+  pip install \
+    diffusers==0.14.0 \
+    huggingface_hub==0.25.2 \
+    accelerate==0.18.0 \
+    transformers==4.27.4 \
+    wandb==0.14.2 \
+    Pillow==9.5.0 \
+    numpy==1.23.5 \
+    tqdm==4.65.0 \
+    matplotlib==3.7.1 \
+    packaging==23.1
+
+RATIONALE (version choices):
+-----------------------------
+- torch 1.11.0+cu113    : locked by Docker image; last official cu113 build
+- torchvision 0.12.0    : exact companion for torch 1.11.0
+- diffusers 0.14.0      : last release before PyTorch >=1.13 became a hard dep;
+                          DDPMScheduler & UNet2DModel APIs identical to later versions
+- huggingface_hub 0.25.2: ROOT CAUSE FIX -- hub 0.26.0 permanently removed
+                          `cached_download`, which diffusers 0.14.0 still imports
+                          via dynamic_modules_utils.py; 0.25.2 is the last version
+                          that kept it (deprecated but present); must be pinned
+                          explicitly because pip will otherwise pull 0.26+ as a
+                          transitive dep of transformers/diffusers
+- accelerate 0.18.0     : requires torch >=1.10; fp16 AMP works with torch 1.11;
+                          avoids 0.19+ which began requiring torch >=1.13 features
+- transformers 4.27.4   : required by diffusers 0.14.0; compatible with torch 1.11
+                          and huggingface_hub 0.25.2
+- wandb 0.14.2          : last release before Python 3.8 support was dropped
+                          (dropped in wandb 0.18.x); safe for Python 3.8
+- Pillow 9.5.0          : last Pillow 9.x; Image.LANCZOS supported; stable on 3.8
+- numpy 1.23.5          : last numpy 1.x fully compatible with Python 3.8 + torch 1.11
+- tqdm 4.65.0           : stable, no breaking changes
+- matplotlib 3.7.1      : Agg backend works; last version supporting Python 3.8 well
+- packaging 23.1        : used by the runtime version guard
+
 Run: python edm_t04_020226_1430_server.py
 """
 
@@ -9,15 +57,13 @@ Run: python edm_t04_020226_1430_server.py
 # =====================================================
 
 # Root folder of the Endo4IE dataset (synced via gdown)
-#DATASET_PATH = "./"          # <-- EDIT THIS
-DATASET_PATH = "../../data/datasets/endo4ie/"
+DATASET_PATH = "/home/user/data/endo4ie"          # <-- EDIT THIS
 
 # Where to save models, checkpoints and samples
-#OUTPUT_BASE  = "./endo_diffusion/output/" # <-- EDIT THIS
-OUTPUT_BASE = "../edm_outputs/edm_t04/"
+OUTPUT_BASE  = "/home/user/outputs/endo_diffusion" # <-- EDIT THIS
 
 # Synthetic dataset output folder
-SYNTHETIC_OUTPUT = "../edm_outputs/edm_t04/synthetic_datasets" # <-- EDIT THIS
+SYNTHETIC_OUTPUT = "/home/user/outputs/synthetic_datasets" # <-- EDIT THIS
 
 # Weights & Biases project name (set to None to disable W&B)
 WANDB_PROJECT = "endo-artifact-generation"        # <-- EDIT or set None
@@ -58,30 +104,47 @@ if WANDB_PROJECT is not None:
 def _check_versions():
     import accelerate as _acc
     import diffusers as _diff
+    import huggingface_hub as _hfh
+
+    # huggingface_hub >= 0.26 removed `cached_download` entirely; diffusers
+    # 0.14.0 imports it at module load time, so this causes an immediate
+    # ImportError before any training code runs. Check this first and hard-exit.
+    hfh_ver = tuple(int(x) for x in _hfh.__version__.split(".")[:2])
+    if hfh_ver >= (0, 26):
+        print(
+            f"\nFATAL: huggingface_hub {_hfh.__version__} is installed.\n"
+            f"  huggingface_hub >= 0.26 removed `cached_download`, which\n"
+            f"  diffusers==0.14.0 requires. Downgrade before running:\n\n"
+            f"      pip install huggingface_hub==0.25.2\n"
+        )
+        sys.exit(1)
 
     checks = [
-        ("Python",      sys.version_info[:2],           (3, 8),  (3, 8),  "3.8.x"),
-        ("torch",       tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]),
-                        (1, 11), (1, 11), "1.11.x"),
-        ("diffusers",   tuple(int(x) for x in _diff.__version__.split(".")[:2]),
-                        (0, 14), (0, 14), "0.14.x"),
-        ("accelerate",  tuple(int(x) for x in _acc.__version__.split(".")[:2]),
-                        (0, 12), (0, 20), "0.12–0.19.x"),
+        ("Python",          sys.version_info[:2],
+                            (3, 8),  (3, 8),  "3.8.x"),
+        ("torch",           tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]),
+                            (1, 11), (1, 11), "1.11.x"),
+        ("diffusers",       tuple(int(x) for x in _diff.__version__.split(".")[:2]),
+                            (0, 14), (0, 14), "0.14.x"),
+        ("huggingface_hub", hfh_ver,
+                            (0, 14), (0, 25), "0.14-0.25.x"),
+        ("accelerate",      tuple(int(x) for x in _acc.__version__.split(".")[:2]),
+                            (0, 12), (0, 20), "0.12-0.19.x"),
     ]
-    warnings = []
+    warnings_list = []
     for name, got, lo, hi, expected in checks:
         if not (lo <= got <= hi):
-            warnings.append(
-                f"  ⚠ {name}: got {'.'.join(str(x) for x in got)}, "
+            warnings_list.append(
+                f"  ! {name}: got {'.'.join(str(x) for x in got)}, "
                 f"expected {expected}"
             )
-    if warnings:
-        print("VERSION WARNING — unexpected library versions detected:")
-        for w in warnings:
+    if warnings_list:
+        print("VERSION WARNING -- unexpected library versions detected:")
+        for w in warnings_list:
             print(w)
         print("Training may still work, but results are not guaranteed.\n")
     else:
-        print("✓ All library versions match the pinned requirements.\n")
+        print("All library versions match the pinned requirements.\n")
 
 _check_versions()
 
