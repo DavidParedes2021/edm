@@ -173,7 +173,7 @@ class ConditionalArtifactDataset(Dataset):
     where <split> is 'train', 'validation', or 'test' (case-insensitive match).
     """
 
-    def __init__(self, base_path, split='train', artifact_type='overexposed', image_size=256):
+    def __init__(self, base_path, split='train', artifact_type='overexposed', image_size=128):
         self.base_path = Path(base_path)
         self.split = split
         self.artifact_type = artifact_type
@@ -246,16 +246,26 @@ class ConditionalArtifactUNet(nn.Module):
     Input channels = 6 (3 noisy artifact + 3 normal condition).
     """
 
-    def __init__(self, image_size=256):
+    def __init__(self, image_size=128):
         super().__init__()
         self.unet = UNet2DModel(
             sample_size=image_size,
             in_channels=6,
             out_channels=3,
-            layers_per_block=2,
-            block_out_channels=(128, 256, 512, 512),
-            down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
-            up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"),
+            layers_per_block=1,           # reduced from 2 -> halves residual memory
+            block_out_channels=(64, 128, 256, 256),  # capped at 256 (was 512)
+            down_block_types=(
+                "DownBlock2D",
+                "DownBlock2D",
+                "DownBlock2D",
+                "AttnDownBlock2D",   # attention only at deepest (smallest) spatial level
+            ),
+            up_block_types=(
+                "AttnUpBlock2D",     # symmetric
+                "UpBlock2D",
+                "UpBlock2D",
+                "UpBlock2D",
+            ),
         )
 
     def forward(self, noisy_artifact, timesteps, normal_condition):
@@ -319,13 +329,14 @@ def train_conditional_diffusion(
     output_dir='./conditional_diffusion',
     wandb_project=None,
     num_epochs=100,
-    batch_size=4,
+    batch_size=2,           # reduced from 4 -> direct VRAM saving
     learning_rate=1e-4,
-    image_size=256,
+    image_size=128,
     num_inference_steps=50,
     save_every_n_epochs=10,
     log_images_every_n_epochs=5,
     num_workers=4,
+    grad_accum_steps=2,     # accumulate 2 steps -> effective batch = batch_size*2
 ):
     """Train conditional diffusion model: p(artifact | normal)."""
 
@@ -352,7 +363,7 @@ def train_conditional_diffusion(
             ),
         )
 
-    accelerator = Accelerator(mixed_precision='fp16')
+    accelerator = Accelerator(mixed_precision='fp16', gradient_accumulation_steps=grad_accum_steps)
 
     train_dataset = ConditionalArtifactDataset(dataset_path, split='train',
                                                artifact_type=artifact_type, image_size=image_size)
@@ -510,7 +521,7 @@ def generate_synthetic_dataset(
     artifact_type,
     num_variations=5,
     num_inference_steps=50,
-    image_size=256,
+    image_size=128,
 ):
     """Generate complete synthetic paired dataset (Normal → Synthetic Artifacts)."""
     model.eval()
@@ -567,7 +578,7 @@ def generate_synthetic_dataset(
 # Inference helpers
 # =====================================================
 
-def load_model_from_checkpoint(checkpoint_path, image_size=256):
+def load_model_from_checkpoint(checkpoint_path, image_size=128):
     """Load a trained model from a .pt checkpoint file."""
     model      = ConditionalArtifactUNet(image_size=image_size)
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -586,7 +597,7 @@ def generate_artifact_from_normal(
     normal_image_path,
     output_path=None,
     num_inference_steps=50,
-    image_size=256,
+    image_size=128,
     seed=42,
 ):
     """Generate a single synthetic artifact from a normal image."""
@@ -658,6 +669,9 @@ def resume_training(
 
 if __name__ == '__main__':
 
+    # Reduce CUDA memory fragmentation (recommended in the OOM error message)
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128')
+
     # Optional: login to W&B (will prompt interactively or use WANDB_API_KEY env var)
     if WANDB_PROJECT is not None:
         wandb.login()
@@ -678,12 +692,13 @@ if __name__ == '__main__':
         output_dir=OUTPUT_BASE,
         wandb_project=WANDB_PROJECT,
         num_epochs=100,
-        batch_size=4,
+        batch_size=2,       # 2 x grad_accum_steps=2 -> effective batch 4
         learning_rate=1e-4,
-        image_size=256,
+        image_size=128,
         num_inference_steps=50,
         save_every_n_epochs=5,
         log_images_every_n_epochs=1,
+        grad_accum_steps=2,
     )
 
     # --------------------------------------------------
@@ -699,12 +714,13 @@ if __name__ == '__main__':
         output_dir=OUTPUT_BASE,
         wandb_project=WANDB_PROJECT,
         num_epochs=100,
-        batch_size=4,
+        batch_size=2,       # 2 x grad_accum_steps=2 -> effective batch 4
         learning_rate=1e-4,
-        image_size=256,
+        image_size=128,
         num_inference_steps=50,
         save_every_n_epochs=10,
         log_images_every_n_epochs=5,
+        grad_accum_steps=2,
     )
 
     # --------------------------------------------------
@@ -726,7 +742,7 @@ if __name__ == '__main__':
         artifact_type='overexposed',
         num_variations=5,
         num_inference_steps=50,
-        image_size=256,
+        image_size=128,
     )
 
     print("\n>>> Generating UNDEREXPOSED synthetic dataset...")
@@ -738,7 +754,7 @@ if __name__ == '__main__':
         artifact_type='underexposed',
         num_variations=5,
         num_inference_steps=50,
-        image_size=256,
+        image_size=128,
     )
 
     # --------------------------------------------------
