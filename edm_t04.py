@@ -26,8 +26,10 @@ WANDB_PROJECT = "endo-artifact-generation"        # <-- EDIT or set None
 # Imports
 # =====================================================
 import os
+import sys
 import numpy as np
 from pathlib import Path
+from packaging import version
 
 import torch
 import torch.nn as nn
@@ -49,6 +51,39 @@ import matplotlib.pyplot as plt
 # Conditional W&B import
 if WANDB_PROJECT is not None:
     import wandb
+
+# =====================================================
+# Runtime version guard — fail fast with a clear message
+# =====================================================
+def _check_versions():
+    import accelerate as _acc
+    import diffusers as _diff
+
+    checks = [
+        ("Python",      sys.version_info[:2],           (3, 8),  (3, 8),  "3.8.x"),
+        ("torch",       tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]),
+                        (1, 11), (1, 11), "1.11.x"),
+        ("diffusers",   tuple(int(x) for x in _diff.__version__.split(".")[:2]),
+                        (0, 14), (0, 14), "0.14.x"),
+        ("accelerate",  tuple(int(x) for x in _acc.__version__.split(".")[:2]),
+                        (0, 12), (0, 20), "0.12–0.19.x"),
+    ]
+    warnings = []
+    for name, got, lo, hi, expected in checks:
+        if not (lo <= got <= hi):
+            warnings.append(
+                f"  ⚠ {name}: got {'.'.join(str(x) for x in got)}, "
+                f"expected {expected}"
+            )
+    if warnings:
+        print("VERSION WARNING — unexpected library versions detected:")
+        for w in warnings:
+            print(w)
+        print("Training may still work, but results are not guaranteed.\n")
+    else:
+        print("✓ All library versions match the pinned requirements.\n")
+
+_check_versions()
 
 # ---------------------------------------------------------------------------
 # Device
