@@ -254,6 +254,7 @@ class ConditionalArtifactUNet(nn.Module):
 
     def __init__(self, image_size=256):
         super().__init__()
+        self._init_kwargs = {"image_size": image_size}  # used by EMA to clone architecture
         self.unet = UNet2DModel(
             sample_size    = image_size,
             in_channels    = 6,
@@ -286,7 +287,14 @@ class EMA:
     """Exponential Moving Average of model parameters for cleaner inference."""
     def __init__(self, model, decay=0.9999):
         self.decay  = decay
-        self.shadow = copy.deepcopy(model).eval()
+        # Avoid deepcopy on an AMP-prepared model (causes PicklingError).
+        # Instead, build a fresh shadow model of the same class and copy
+        # weights via state_dict — safe with accelerate's AMP wrapping.
+        self.shadow = model.__class__(**model._init_kwargs).eval()
+        self.shadow.load_state_dict(
+            {k: v.clone() for k, v in model.state_dict().items()}
+        )
+        self.shadow.to(next(model.parameters()).device)
         for p in self.shadow.parameters():
             p.requires_grad_(False)
 
