@@ -254,22 +254,24 @@ class ConditionalArtifactUNet(nn.Module):
 
     def __init__(self, image_size=256):
         super().__init__()
-        self._init_kwargs = {"image_size": image_size}  # used by EMA to clone architecture
         self.unet = UNet2DModel(
             sample_size    = image_size,
             in_channels    = 6,
             out_channels   = 3,
-            layers_per_block = 2,                       # FIX #10
+        # P100-16GB: layers_per_block=1 (was 2) halves residual activation memory.
+        # Attention ONLY at deepest level (16x16): AttnDownBlock2D at 32x32 x 512ch
+        # needs ~8 GiB for baddbmm attention scores alone -- OOM on P100.
+            layers_per_block = 1,                       # reduced 2->1: ~40% less activation memory
             block_out_channels = (128, 256, 512, 512),  # larger capacity
             down_block_types = (
                 "DownBlock2D",
                 "DownBlock2D",
-                "AttnDownBlock2D",   # attention at 32×32
-                "AttnDownBlock2D",   # attention at 16×16  FIX #2
+                "DownBlock2D",       # was AttnDownBlock2D at 32x32 -- OOM on P100
+                "AttnDownBlock2D",   # attention only at deepest 16x16 level
             ),
             up_block_types = (
                 "AttnUpBlock2D",
-                "AttnUpBlock2D",     # FIX #2
+                "UpBlock2D",         # was AttnUpBlock2D -- matches removed down attn
                 "UpBlock2D",
                 "UpBlock2D",
             ),
@@ -287,14 +289,7 @@ class EMA:
     """Exponential Moving Average of model parameters for cleaner inference."""
     def __init__(self, model, decay=0.9999):
         self.decay  = decay
-        # Avoid deepcopy on an AMP-prepared model (causes PicklingError).
-        # Instead, build a fresh shadow model of the same class and copy
-        # weights via state_dict — safe with accelerate's AMP wrapping.
-        self.shadow = model.__class__(**model._init_kwargs).eval()
-        self.shadow.load_state_dict(
-            {k: v.clone() for k, v in model.state_dict().items()}
-        )
-        self.shadow.to(next(model.parameters()).device)
+        self.shadow = copy.deepcopy(model).eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
 
@@ -787,7 +782,7 @@ def resume_training(checkpoint_path, dataset_path, artifact_type,
 # =====================================================
 if __name__ == '__main__':
     # Reduce CUDA memory fragmentation
-    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128')
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:64')  # P100: smaller splits reduce fragmentation
 
     if WANDB_PROJECT is not None:
         wandb.login()
@@ -808,13 +803,13 @@ if __name__ == '__main__':
         output_dir               = OUTPUT_BASE,
         wandb_project            = WANDB_PROJECT,
         num_epochs               = 150,
-        batch_size               = 4,          # per GPU; scales with num-GPUs
+        batch_size               = 2,          # P100-16GB: halved from 4 (same effective=8 via grad_accum x4)
         learning_rate            = 5e-5,
         image_size               = 256,        # FIX #1
         num_inference_steps      = 50,
         save_every_n_epochs      = 5,
         log_images_every_n_epochs= 2,
-        grad_accum_steps         = 2,
+        grad_accum_steps         = 4,          # compensates halved batch: effective batch = 2x4 = 8
         guidance_scale           = 3.0,
         cond_drop_prob           = 0.10,
         perceptual_weight        = 0.5,
@@ -835,13 +830,13 @@ if __name__ == '__main__':
         output_dir               = OUTPUT_BASE,
         wandb_project            = WANDB_PROJECT,
         num_epochs               = 150,
-        batch_size               = 4,
+        batch_size               = 2,          # P100-16GB: halved from 4 (same effective=8 via grad_accum x4)
         learning_rate            = 5e-5,
         image_size               = 256,
         num_inference_steps      = 50,
         save_every_n_epochs      = 5,
         log_images_every_n_epochs= 2,
-        grad_accum_steps         = 2,
+        grad_accum_steps         = 4,          # compensates halved batch: effective batch = 2x4 = 8
         guidance_scale           = 3.0,
         cond_drop_prob           = 0.10,
         perceptual_weight        = 0.5,
