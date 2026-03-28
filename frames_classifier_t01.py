@@ -127,17 +127,12 @@ model = YOLO("yolov8m-cls.pt")   # medium instead of nano
 
 model.train(
     data=OUTPUT_DIR,
-
-    # FIX 4: More epochs with early stopping
     epochs=80,
-    patience=15,          # stops if val/loss doesn't improve for 15 epochs
-
-    # FIX 5: Larger image size preserves texture detail
+    patience=15,
     imgsz=320,
-
-    batch=16,             # reduce from 32 if you hit OOM with the larger model
+    batch=32,        # DGX GPUs (A100/H100) have large VRAM, increase batch size
     device=0,
-    workers=0,
+    workers=8,       # rule of thumb: 2–4× number of CPU cores per GPU, cap at 8–16
 
     # FIX 6: Freeze backbone for the first few epochs, then unfreeze
     #freeze=10,            # freeze first 10 layers during warm-up epochs
@@ -147,25 +142,18 @@ model.train(
     hsv_s=0.0,            # no saturation jitter
     hsv_v=0.0,            # no brightness jitter
     hsv_h=0.0,            # no hue jitter
-
-    # Keep geometric augmentations — they don't hurt colour features
     fliplr=0.5,
     flipud=0.1,
     degrees=10,
     translate=0.1,
     scale=0.3,
-
-    # FIX 8: Lower LR with warmup for stable fine-tuning
     lr0=1e-3,
     lrf=0.01,
     warmup_epochs=5,
     optimizer="AdamW",
-
-    # Logging
     project="ead_classifier",
     name="yolov8m_run1",
     save_period=10,
     val=True,
 )
-
 print("Training complete!")
