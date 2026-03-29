@@ -8,8 +8,8 @@ data:
   # over_dir:    "../edm2020_classified_sample/overexposed_frames"
   # under_dir:   "../edm2020_classified_sample/underexposed_frames"
   normal_dir:  "../../../data/datasets/ead_2020_classified/edm2020_classified/normal_frames"
-  over_dir:    "../../edm2020_classified_sample/overexposed_frames"
-  under_dir:   "../../edm2020_classified_sample/underexposed_frames"
+  over_dir:    "../../../data/datasets/ead_2020_classified/edm2020_classified/overexposed_frames"
+  under_dir:   "../../../data/datasets/ead_2020_classified/edm2020_classified/underexposed_frames"
   image_size:  256
   num_workers: 4
 
