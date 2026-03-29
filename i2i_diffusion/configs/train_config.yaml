@@ -7,9 +7,9 @@ data:
   # normal_dir:  "../edm2020_classified_sample/normal_frames"
   # over_dir:    "../edm2020_classified_sample/overexposed_frames"
   # under_dir:   "../edm2020_classified_sample/underexposed_frames"
-  normal_dir:  "../../data/datasets/ead_2020_classified/edm2020_classified/normal_frames"
-  over_dir:    "../edm2020_classified_sample/overexposed_frames"
-  under_dir:   "../edm2020_classified_sample/underexposed_frames"
+  normal_dir:  "../../../data/datasets/ead_2020_classified/edm2020_classified/normal_frames"
+  over_dir:    "../../edm2020_classified_sample/overexposed_frames"
+  under_dir:   "../../edm2020_classified_sample/underexposed_frames"
   image_size:  256
   num_workers: 4
 
@@ -42,7 +42,7 @@ diffusion:
   clip_sample:         false
 
 training:
-  output_dir:          "../i2i_diffusion_output/runs"
+  output_dir:          "../../i2i_diffusion_output/runs"
   run_name:            "illum_dgx16"
   seed:                42
   mixed_precision:     "fp16"
