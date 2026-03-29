@@ -291,19 +291,25 @@ def main(config_path: str, resume: str | None = None) -> None:
             ssim_over = val_metrics.get("ssim_grad_over", 0.0)
             if ssim_over > best_ssim:
                 best_ssim = ssim_over
-                best_path = Path(run_dir) / "checkpoints" / "best.pt"
-                best_path.parent.mkdir(parents=True, exist_ok=True)
-                trainer.save_checkpoint(str(run_dir), epoch)
+                ckpt_dir  = Path(run_dir) / "checkpoints"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                # write to a temp name then copy to best.pt atomically
+                tmp_path  = ckpt_dir / "_best_tmp.pt"
+                best_path = ckpt_dir / "best.pt"
+                trainer.save_checkpoint(str(run_dir), epoch, filename="_best_tmp.pt")
                 import shutil
-                shutil.copy(
-                    Path(run_dir) / "checkpoints" / f"epoch_{epoch:04d}.pt",
-                    best_path,
-                )
+                shutil.move(str(tmp_path), str(best_path))
                 log.info(f"  ↑ New best SSIM {best_ssim:.4f} → saved best.pt")
 
-        # periodic checkpoint
+        # periodic "last" checkpoint — delete previous last to save disk space
         if (epoch + 1) % tc["save_every"] == 0:
-            trainer.save_checkpoint(str(run_dir), epoch + 1)
+            ckpt_dir  = Path(run_dir) / "checkpoints"
+            last_path = ckpt_dir / "last.pt"
+            # remove previous last if it exists
+            if last_path.exists():
+                last_path.unlink()
+            trainer.save_checkpoint(str(run_dir), epoch + 1, filename="last.pt")
+            log.info(f"  Checkpoint saved → last.pt (epoch {epoch + 1})")
 
     trainer.logger.finish()
     log.info("Training complete.")

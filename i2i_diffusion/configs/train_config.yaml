@@ -27,13 +27,13 @@ model:
   unet:
     in_channels:        4
     out_channels:       3
-    model_channels:     64        # (64,128,256,512)
-    channel_mult:       [1, 2, 4, 8]
-    attention_resolutions: [32, 16]   # documentation only — code uses attn_max_resolution
+    model_channels:     96        # 96×[1,2,4,4] = (96,192,384,384) — more capacity
+    channel_mult:       [1, 2, 4, 4]
+    attention_resolutions: [32, 16]
     num_res_blocks:     2
-    dropout:            0.1       # kept for docs; not passed to UNet2DConditionModel
+    dropout:            0.1
     num_classes:        2
-    class_embed_dim:    256       # reduced from 512 — halves cross-attn KV size
+    class_embed_dim:    256
   controlnet:
     enabled:            true
     in_channels:        1
@@ -58,9 +58,9 @@ training:
   mixed_precision:     "fp16"
 
   optimizer:           "adamw"
-  lr:                  1.0e-4
+  lr:                  2.0e-4     # increased from 1e-4 — helps convergence early
   lr_scheduler:        "cosine"
-  warmup_steps:        500
+  warmup_steps:        200        # reduced from 500 — reach full lr faster
   weight_decay:        1.0e-2
   grad_clip:           1.0
 

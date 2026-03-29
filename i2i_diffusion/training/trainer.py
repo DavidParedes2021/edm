@@ -267,10 +267,13 @@ class IlluminationDiffusionTrainer:
             l_diff     = F.mse_loss(eps_pred_b, target_b) \
                        + F.mse_loss(eps_pred_c, target_c)
 
-        # Recover x̂_0 for auxiliary losses (do outside autocast to keep fp32)
-        with torch.no_grad():
-            x0_b = self._predict_x0(x_b_noisy, eps_pred_b.detach(), t)
-            x0_c = self._predict_x0(x_c_noisy, eps_pred_c.detach(), t)
+            # Recover x̂_0 for auxiliary losses.
+            # NOTE: do NOT detach eps_pred here — SSIM and perceptual losses
+            # must backpropagate through the noise prediction so the U-Net
+            # actually learns from them.  The no_grad+detach pattern was a
+            # bug that made these losses contribute zero gradient.
+            x0_b = self._predict_x0(x_b_noisy, eps_pred_b, t)
+            x0_c = self._predict_x0(x_c_noisy, eps_pred_c, t)
 
         # ── Step 4: SSIM loss (cheap — always on) ─────────────────────────
         with autocast(enabled=use_amp):
@@ -285,7 +288,8 @@ class IlluminationDiffusionTrainer:
         else:
             l_perc = torch.zeros(1, device=self.dev)
 
-        # Free intermediate tensors before expensive cycle passes
+        # Free x0 estimates before the expensive cycle passes.
+        # eps_pred is no longer needed after this point.
         del x0_b, x0_c, eps_pred_b, eps_pred_c
         del x_b_noisy, x_c_noisy, eps_b, eps_c
         if torch.cuda.is_available():
@@ -413,21 +417,29 @@ class IlluminationDiffusionTrainer:
 
     # ── checkpointing ─────────────────────────────────────────────────────────
 
-    def save_checkpoint(self, output_dir: str, epoch: int) -> None:
+    def save_checkpoint(self, output_dir: str, epoch: int, filename: str | None = None) -> None:
         ckpt_dir = Path(output_dir) / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        path = ckpt_dir / f"epoch_{epoch:04d}.pt"
+        # Use explicit filename if given, otherwise fall back to epoch-numbered name
+        path = ckpt_dir / (filename if filename else f"epoch_{epoch:04d}.pt")
 
         mc      = self.cfg["model"]
+        img     = self.cfg["data"]["image_size"]
         base_ch = mc["unet"]["model_channels"]
         block_ch = tuple(base_ch * m for m in mc["unet"]["channel_mult"])
 
         state = {
-            "epoch":             epoch,
-            "global_step":       self.global_step,
+            "epoch":              epoch,
+            "global_step":        self.global_step,
+            # ── full architecture spec so inference can reconstruct exactly ──
             "block_out_channels": block_ch,
-            "class_embed_dim":   mc["unet"]["class_embed_dim"],
-            "unet":              self.unet.state_dict(),
+            "class_embed_dim":    mc["unet"]["class_embed_dim"],
+            "in_channels":        mc["unet"]["in_channels"],
+            "image_size":         img,
+            "layers_per_block":   mc["unet"]["num_res_blocks"],
+            "num_classes":        mc["unet"]["num_classes"],
+            # ── weights ────────────────────────────────────────────────────
+            "unet":               self.unet.state_dict(),
             "disc_over":         self.disc_over.state_dict(),
             "disc_under":        self.disc_under.state_dict(),
             "opt_g":             self.opt_g.state_dict(),
