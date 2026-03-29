@@ -1,0 +1,73 @@
+data:
+  image_size: 32
+  normal_dir: ../edm2020_classified_sample/normal_frames
+  num_workers: 0
+  over_dir: ../edm2020_classified_sample/overexposed_frames
+  under_dir: ../edm2020_classified_sample/underexposed_frames
+diffusion:
+  beta_end: 0.02
+  beta_schedule: linear
+  beta_start: 0.0001
+  clip_sample: false
+  num_train_timesteps: 1000
+  prediction_type: epsilon
+inference:
+  batch_size: 4
+  ddim_steps: 50
+  eta: 0.0
+  guidance_scale: 5.0
+logging:
+  log_images_every: 10
+  wandb:
+    enabled: true
+    entity: null
+    project: illum-diffusion
+model:
+  controlnet:
+    enabled: true
+    in_channels: 1
+    num_layers: 4
+    out_channels: 128
+  discriminator:
+    n_layers: 3
+    ndf: 64
+  unet:
+    attention_resolutions:
+    - 16
+    - 8
+    channel_mult:
+    - 1
+    - 2
+    - 4
+    - 8
+    class_embed_dim: 512
+    dropout: 0.1
+    in_channels: 4
+    model_channels: 128
+    num_classes: 2
+    num_res_blocks: 2
+    out_channels: 3
+training:
+  batch_size: 8
+  ema:
+    decay: 0.9999
+    enabled: true
+  eval_every: 5
+  grad_clip: 1.0
+  lambda_adv: 1.0
+  lambda_cycle: 10.0
+  lambda_identity: 5.0
+  lambda_perc: 0.1
+  lambda_ssim: 0.05
+  log_every: 50
+  lr: 0.0001
+  lr_scheduler: cosine
+  mixed_precision: fp16
+  num_epochs: 200
+  optimizer: adamw
+  output_dir: runs
+  run_name: illum_v1
+  save_every: 10
+  seed: 42
+  warmup_steps: 500
+  weight_decay: 0.01

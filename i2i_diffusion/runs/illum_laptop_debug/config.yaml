@@ -1,0 +1,74 @@
+data:
+  image_size: 128
+  normal_dir: ../edm2020_classified_sample/normal_frames
+  num_workers: 0
+  over_dir: ../edm2020_classified_sample/overexposed_frames
+  under_dir: ../edm2020_classified_sample/underexposed_frames
+diffusion:
+  beta_end: 0.02
+  beta_schedule: linear
+  beta_start: 0.0001
+  clip_sample: false
+  num_train_timesteps: 1000
+  prediction_type: epsilon
+inference:
+  batch_size: 1
+  ddim_steps: 20
+  eta: 0.0
+  guidance_scale: 5.0
+logging:
+  log_images_every: 2
+  wandb:
+    enabled: false
+model:
+  controlnet:
+    enabled: false
+    in_channels: 1
+    num_layers: 2
+    out_channels: 32
+  discriminator:
+    n_layers: 1
+    ndf: 16
+  unet:
+    attention_resolutions:
+    - 8
+    channel_mult:
+    - 1
+    - 2
+    - 4
+    - 4
+    class_embed_dim: 128
+    dropout: 0.0
+    in_channels: 4
+    model_channels: 32
+    num_classes: 2
+    num_res_blocks: 1
+    out_channels: 3
+training:
+  batch_size: 1
+  cycle_start_epoch: 999
+  ema:
+    enabled: false
+  eval_every: 2
+  grad_clip: 1.0
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  identity_start_epoch: 999
+  lambda_adv: 0.0
+  lambda_cycle: 0.0
+  lambda_identity: 0.0
+  lambda_perc: 0.0
+  lambda_ssim: 0.05
+  log_every: 10
+  lr: 0.0001
+  lr_scheduler: cosine
+  mixed_precision: fp16
+  num_epochs: 10
+  optimizer: adamw
+  output_dir: runs
+  perceptual_every: 999
+  run_name: illum_laptop_debug
+  save_every: 5
+  seed: 42
+  warmup_steps: 100
+  weight_decay: 0.01
