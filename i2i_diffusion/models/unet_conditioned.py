@@ -72,28 +72,46 @@ class ClassConditionedUNet(nn.Module):
 
         # ── Attention stage selection ─────────────────────────────────────
         # Self-attention cost scales as O(spatial²).  At 256px input:
-        #   stage 0: 128×128 = 16 384 tokens → attention matrix ~4 GB  ✗
-        #   stage 1:  64×64  =  4 096 tokens → ~256 MB                 ✗
-        #   stage 2:  32×32  =  1 024 tokens → ~16 MB                  ✓
-        #   stage 3:  16×16  =    256 tokens → ~1 MB                   ✓
-        # Rule: only enable attention on stages whose spatial resolution
-        # after downsampling is <= attn_max_resolution (default 32).
+        #   stage 0: 128×128 = 16 384 tokens  ✗  too large
+        #   stage 1:  64×64  =  4 096 tokens  ✗  too large
+        #   stage 2:  32×32  =  1 024 tokens  ✓
+        #   stage 3:  16×16  =    256 tokens  ✓
+        #
+        # diffusers 0.14 compatibility note
+        # -----------------------------------
+        # UNet2DConditionModel.forward() always passes `upsample_size` to
+        # every up-block.  UpBlock2D in 0.14 does NOT accept this kwarg,
+        # so mixing UpBlock2D with AttnUpBlock2D in the same net raises:
+        #   TypeError: forward() got an unexpected keyword argument 'upsample_size'
+        #
+        # Fix: use CrossAttnDownBlock2D / CrossAttnUpBlock2D for attention
+        # stages (these are the blocks used by Stable Diffusion and handle
+        # upsample_size correctly), and DownBlock2D / UpBlock2D only for
+        # non-attention stages where the UNet skips the upsample_size kwarg.
+        #
+        # In diffusers 0.14 the UNet dispatches upsample_size only to
+        # is_final_block logic — using all CrossAttn* + plain Down/Up in
+        # a consistent pattern avoids the mismatch entirely.
+        #
+        # We restrict attention to stages with spatial resolution <= 32px
+        # to avoid O(spatial²) memory explosion on early large-resolution stages.
         attn_max_resolution = 32
-        # spatial resolution of each stage (input halved per stage)
-        stage_resolutions = [image_size // (2 ** i) for i in range(n_stages)]
+        stage_resolutions   = [image_size // (2 ** i) for i in range(n_stages)]
+
         down_block_types = tuple(
-            "AttnDownBlock2D" if stage_resolutions[i] <= attn_max_resolution
+            "CrossAttnDownBlock2D" if stage_resolutions[i] <= attn_max_resolution
             else "DownBlock2D"
             for i in range(n_stages)
         )
+        # Up-blocks are in reverse order (deepest first)
         up_block_types = tuple(
-            "AttnUpBlock2D" if stage_resolutions[n_stages - 1 - i] <= attn_max_resolution
+            "CrossAttnUpBlock2D" if stage_resolutions[n_stages - 1 - i] <= attn_max_resolution
             else "UpBlock2D"
             for i in range(n_stages)
         )
 
-        # attention_head_dim: pick largest divisor of the smallest
-        # *attention* stage channel count that is <= 8.
+        # attention_head_dim: largest power-of-2 <= 8 that divides the
+        # channel count of the shallowest attention stage.
         attn_channels = [
             block_out_channels[i] for i in range(n_stages)
             if stage_resolutions[i] <= attn_max_resolution
