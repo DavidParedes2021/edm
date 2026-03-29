@@ -102,7 +102,6 @@ class IlluminationDiffusionTrainer:
             image_size         = img,
             block_out_channels = block_ch,
             layers_per_block   = mc["unet"]["num_res_blocks"],
-            dropout            = mc["unet"]["dropout"],
         )
 
         # ── gradient checkpointing ────────────────────────────────────────

@@ -58,7 +58,6 @@ class ClassConditionedUNet(nn.Module):
         image_size:         int   = 256,
         block_out_channels: tuple = (128, 256, 512, 512),
         layers_per_block:   int   = 2,
-        dropout:            float = 0.1,
     ) -> None:
         super().__init__()
 
@@ -90,6 +89,9 @@ class ClassConditionedUNet(nn.Module):
             + ("UpBlock2D",)
         )
 
+        # dropout is NOT a top-level kwarg in diffusers 0.14's
+        # UNet2DConditionModel — it is set internally per-block.
+        # Passing it raises TypeError, so we drop it here.
         self.unet = UNet2DConditionModel(
             sample_size         = image_size,
             in_channels         = in_channels,
@@ -100,7 +102,6 @@ class ClassConditionedUNet(nn.Module):
             up_block_types      = up_block_types,
             cross_attention_dim = class_embed_dim,
             attention_head_dim  = attention_head_dim,
-            dropout             = dropout,
         )
 
     # ── forward ───────────────────────────────────────────────────────────────
