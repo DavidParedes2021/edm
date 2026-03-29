@@ -1,8 +1,18 @@
-# ──────────────────────────────────────────────
-#  Illumination Artifact Diffusion – Train Config
-# ──────────────────────────────────────────────
-
-# ── Data ──────────────────────────────────────
+# ── DGX single GPU 16 GB  ─────────────────────────────────────────────────────
+#
+# Architecture notes
+# ------------------
+# block_out_channels = model_channels × channel_mult = 64×[1,2,4,8]
+#                    = (64, 128, 256, 512)
+#
+# Attention is restricted to the two deepest stages (spatial res ≤ 32px):
+#   stage 2: 32×32  →  1 024 tokens  — safe
+#   stage 3: 16×16  →    256 tokens  — safe
+#   stage 0/1: 128×128 / 64×64  — NO attention (too large)
+#
+# class_embed_dim=256 keeps the cross-attention KV projection small.
+# effective batch = batch_size × gradient_accumulation_steps = 2×4 = 8.
+#
 data:
   # normal_dir:  "../edm2020_classified_sample/normal_frames"
   # over_dir:    "../edm2020_classified_sample/overexposed_frames"
@@ -17,20 +27,20 @@ model:
   unet:
     in_channels:        4
     out_channels:       3
-    model_channels:     64          # 64×[1,2,4,8] = (64,128,256,512)
+    model_channels:     64        # (64,128,256,512)
     channel_mult:       [1, 2, 4, 8]
-    attention_resolutions: [16, 8]
+    attention_resolutions: [32, 16]   # documentation only — code uses attn_max_resolution
     num_res_blocks:     2
-    dropout:            0.1
+    dropout:            0.1       # kept for docs; not passed to UNet2DConditionModel
     num_classes:        2
-    class_embed_dim:    512
+    class_embed_dim:    256       # reduced from 512 — halves cross-attn KV size
   controlnet:
     enabled:            true
     in_channels:        1
     out_channels:       64
     num_layers:         3
   discriminator:
-    ndf:                32          # lighter patch discriminator
+    ndf:                32
     n_layers:           2
 
 diffusion:
@@ -42,7 +52,7 @@ diffusion:
   clip_sample:         false
 
 training:
-  output_dir:          "../../i2i_diffusion_output/runs"
+  output_dir:          "runs"
   run_name:            "illum_dgx16"
   seed:                42
   mixed_precision:     "fp16"
@@ -54,18 +64,17 @@ training:
   weight_decay:        1.0e-2
   grad_clip:           1.0
 
-  batch_size:          4            # 4 fits comfortably on 16 GB
-  gradient_accumulation_steps: 2   # effective batch = 8
+  batch_size:          2            # 2 per micro-step
+  gradient_accumulation_steps: 4   # effective batch = 8
   num_epochs:          200
   save_every:          10
   eval_every:          5
   log_every:           50
 
-  # Memory knobs
-  gradient_checkpointing:  true    # recompute activations on backward
-  cycle_start_epoch:       20      # delay cycle loss — saves ~2 fwd passes early
-  identity_start_epoch:    10      # delay identity loss
-  perceptual_every:        2       # compute perceptual loss every N steps (expensive)
+  gradient_checkpointing:  true
+  cycle_start_epoch:       20
+  identity_start_epoch:    10
+  perceptual_every:        2
 
   lambda_perc:         0.10
   lambda_ssim:         0.05

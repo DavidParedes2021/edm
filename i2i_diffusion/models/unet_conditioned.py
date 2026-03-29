@@ -70,23 +70,37 @@ class ClassConditionedUNet(nn.Module):
 
         n_stages = len(block_out_channels)
 
-        # attention_head_dim must divide every stage channel count that uses
-        # attention. Pick the largest power-of-2 <= 8 that divides the
-        # smallest stage channel count.
-        min_ch = min(block_out_channels)
-        attention_head_dim = next(
-            h for h in [8, 4, 2, 1] if min_ch % h == 0
+        # ── Attention stage selection ─────────────────────────────────────
+        # Self-attention cost scales as O(spatial²).  At 256px input:
+        #   stage 0: 128×128 = 16 384 tokens → attention matrix ~4 GB  ✗
+        #   stage 1:  64×64  =  4 096 tokens → ~256 MB                 ✗
+        #   stage 2:  32×32  =  1 024 tokens → ~16 MB                  ✓
+        #   stage 3:  16×16  =    256 tokens → ~1 MB                   ✓
+        # Rule: only enable attention on stages whose spatial resolution
+        # after downsampling is <= attn_max_resolution (default 32).
+        attn_max_resolution = 32
+        # spatial resolution of each stage (input halved per stage)
+        stage_resolutions = [image_size // (2 ** i) for i in range(n_stages)]
+        down_block_types = tuple(
+            "AttnDownBlock2D" if stage_resolutions[i] <= attn_max_resolution
+            else "DownBlock2D"
+            for i in range(n_stages)
+        )
+        up_block_types = tuple(
+            "AttnUpBlock2D" if stage_resolutions[n_stages - 1 - i] <= attn_max_resolution
+            else "UpBlock2D"
+            for i in range(n_stages)
         )
 
-        # First stage: plain DownBlock (no attention — too spatially large).
-        # All subsequent stages use attention.
-        down_block_types = (
-            ("DownBlock2D",)
-            + ("AttnDownBlock2D",) * (n_stages - 1)
-        )
-        up_block_types = (
-            ("AttnUpBlock2D",) * (n_stages - 1)
-            + ("UpBlock2D",)
+        # attention_head_dim: pick largest divisor of the smallest
+        # *attention* stage channel count that is <= 8.
+        attn_channels = [
+            block_out_channels[i] for i in range(n_stages)
+            if stage_resolutions[i] <= attn_max_resolution
+        ]
+        min_attn_ch = min(attn_channels) if attn_channels else block_out_channels[-1]
+        attention_head_dim = next(
+            h for h in [8, 4, 2, 1] if min_attn_ch % h == 0
         )
 
         # dropout is NOT a top-level kwarg in diffusers 0.14's
