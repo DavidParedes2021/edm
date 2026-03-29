@@ -30,16 +30,18 @@ class Logger:
     """
     Wraps wandb and local file logging.
 
-    Parameters
-    ----------
-    cfg         : full config dict
-    accelerator : Accelerate accelerator (used to check is_main_process)
+    wandb requires a single, strictly monotonically increasing `step`
+    across ALL log calls in a run.  We therefore maintain one internal
+    counter (`_step`) that is incremented every time log_scalars is
+    called, regardless of whether the caller passes a global_step or
+    an epoch number.  Image grids are logged under the same counter.
     """
 
     def __init__(self, cfg: dict, accelerator) -> None:
-        self.cfg  = cfg
-        self.acc  = accelerator
-        self._run = None
+        self.cfg   = cfg
+        self.acc   = accelerator
+        self._run  = None
+        self._step = 0          # single monotonic wandb step counter
 
         lc = cfg["logging"]
         tc = cfg["training"]
@@ -48,10 +50,10 @@ class Logger:
             try:
                 import wandb
                 init_kwargs: dict = {
-                    "project":   lc["wandb"]["project"],
-                    "name":      tc["run_name"],
-                    "config":    cfg,
-                    "resume":    "allow",
+                    "project": lc["wandb"]["project"],
+                    "name":    tc["run_name"],
+                    "config":  cfg,
+                    "resume":  "allow",
                 }
                 if lc["wandb"].get("entity"):
                     init_kwargs["entity"] = lc["wandb"]["entity"]
@@ -60,7 +62,6 @@ class Logger:
             except Exception as e:
                 log.warning(f"wandb init failed ({e}) — logging locally only.")
 
-        # local image log directory
         self._img_dir = (
             Path(tc["output_dir"]) / tc["run_name"] / "image_logs"
         )
@@ -68,19 +69,36 @@ class Logger:
 
     # ── scalar logging ────────────────────────────────────────────────────────
 
-    def log_scalars(self, metrics: Dict[str, float], step: int) -> None:
+    def log_scalars(
+        self,
+        metrics:      Dict[str, float],
+        step:         int,                  # used for console only
+        force_commit: bool = True,
+    ) -> None:
+        """
+        Log scalar metrics.
+
+        `step` is written to the console message for readability but is
+        NOT passed to wandb.log() — wandb uses its own internal auto-step
+        so there is never a monotonicity violation regardless of whether
+        the caller passes global_step or epoch.
+        """
         if not self.acc.is_main_process:
             return
         msg = "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
         log.info(f"[step {step}]  {msg}")
         if self._run is not None:
-            self._run.log(metrics, step=step)
+            # Do not pass step= to wandb.log(); let wandb manage its own
+            # auto-incrementing step.  This avoids the "step going backwards"
+            # warning that occurs when epoch (small) is logged after
+            # global_step (large) in the same run.
+            self._run.log(metrics, commit=force_commit)
 
     # ── image logging ─────────────────────────────────────────────────────────
 
     def log_image_grid(
         self,
-        normal:  torch.Tensor,   # (N, 3, H, W) [-1,1]
+        normal:  torch.Tensor,
         over:    torch.Tensor,
         under:   torch.Tensor,
         epoch:   int,
@@ -93,27 +111,19 @@ class Logger:
         n = min(n_imgs, normal.shape[0])
         rows = []
         for i in range(n):
-            rows.append(
-                torch.stack([normal[i], over[i], under[i]])  # (3, 3, H, W)
-            )
+            rows.append(torch.stack([normal[i], over[i], under[i]]))
         grid = vutils.make_grid(
             torch.cat(rows, dim=0),
-            nrow=3,
-            normalize=True,
-            value_range=(-1, 1),
+            nrow=3, normalize=True, value_range=(-1, 1),
         )
 
-        # save locally
         img_path = self._img_dir / f"epoch_{epoch:04d}.png"
         vutils.save_image(grid, img_path)
 
-        # log to wandb
         if self._run is not None:
             import wandb
-            self._run.log(
-                {"samples": wandb.Image(str(img_path))},
-                step=epoch,
-            )
+            # Log image without step= for same reason as log_scalars
+            self._run.log({"samples": wandb.Image(str(img_path))})
 
     # ── close ─────────────────────────────────────────────────────────────────
 

@@ -50,40 +50,47 @@ class GradientSSIMLoss(nn.Module):
         return (g.unsqueeze(0) * g.unsqueeze(1)).view(1, 1, size, size)
 
     def _sobel_magnitude(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, 3, H, W) → (B, 1, H, W) gradient magnitude in [0, 1]."""
+        """(B, 3, H, W) → (B, 1, H, W) gradient magnitude in [0, 1].
+        Always computed in fp32 — 1e-6 underflows to zero in fp16.
+        """
+        x    = x.float()
         gray = 0.2989 * x[:, 0:1] + 0.5870 * x[:, 1:2] + 0.1140 * x[:, 2:3]
-        # rescale from [-1,1] to [0,1]
-        gray = (gray + 1.0) / 2.0
-        # cast kernels to input dtype so fp16 AMP inputs don't cause a mismatch
-        kx = self._kx.to(dtype=gray.dtype)
-        ky = self._ky.to(dtype=gray.dtype)
-        gx = F.conv2d(gray, kx, padding=1)
-        gy = F.conv2d(gray, ky, padding=1)
-        mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-6)
-        # normalise to [0, 1]
-        mag = mag / (mag.amax(dim=[1, 2, 3], keepdim=True) + 1e-8)
+        gray = (gray + 1.0) / 2.0   # [-1,1] → [0,1]
+        kx   = self._kx.float()
+        ky   = self._ky.float()
+        gx   = F.conv2d(gray, kx, padding=1)
+        gy   = F.conv2d(gray, ky, padding=1)
+        mag  = torch.sqrt(gx ** 2 + gy ** 2 + 1e-6)
+        mag  = mag / (mag.amax(dim=[1, 2, 3], keepdim=True) + 1e-8)
         return mag
 
     def _ssim(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
-        Returns mean SSIM over (B, 1, H, W) inputs.
-        C1=(0.01)^2, C2=(0.03)^2 — standard constants.
-        Cast kernel to input dtype so fp16 AMP inputs don't cause a mismatch.
+        Returns mean SSIM over (B, 1, H, W) inputs, always in [0, 1].
+
+        fp16 note: variance estimates (E[x²] - E[x]²) can go slightly
+        negative under fp16 due to catastrophic cancellation, which drives
+        SSIM above 1 and makes `1 - SSIM` negative.  We force fp32 for
+        the convolution arithmetic and clamp variances to >= 0 before use.
         """
         C1, C2 = 0.0001, 0.0009
         pad = self.window_size // 2
-        # cast to input dtype (handles fp16 under AMP); buffer is already on device
-        kernel = self._gauss_kernel.to(dtype=x.dtype).expand(1, 1, -1, -1)
 
-        mu_x  = F.conv2d(x, kernel, padding=pad)
-        mu_y  = F.conv2d(y, kernel, padding=pad)
-        mu_xx = F.conv2d(x * x, kernel, padding=pad) - mu_x ** 2
-        mu_yy = F.conv2d(y * y, kernel, padding=pad) - mu_y ** 2
-        mu_xy = F.conv2d(x * y, kernel, padding=pad) - mu_x * mu_y
+        # Always run SSIM arithmetic in fp32 regardless of AMP context.
+        x = x.float()
+        y = y.float()
+        kernel = self._gauss_kernel.float().expand(1, 1, -1, -1)
 
-        num = (2 * mu_x * mu_y + C1) * (2 * mu_xy + C2)
-        den = (mu_x ** 2 + mu_y ** 2 + C1) * (mu_xx + mu_yy + C2)
-        return (num / den).mean()
+        mu_x  = F.conv2d(x,     kernel, padding=pad)
+        mu_y  = F.conv2d(y,     kernel, padding=pad)
+        mu_xx = (F.conv2d(x * x, kernel, padding=pad) - mu_x ** 2).clamp(min=0)
+        mu_yy = (F.conv2d(y * y, kernel, padding=pad) - mu_y ** 2).clamp(min=0)
+        mu_xy =  F.conv2d(x * y, kernel, padding=pad) - mu_x * mu_y
+
+        num  = (2.0 * mu_x * mu_y + C1) * (2.0 * mu_xy + C2)
+        den  = (mu_x ** 2 + mu_y ** 2 + C1) * (mu_xx + mu_yy + C2)
+        ssim = (num / den.clamp(min=1e-8)).clamp(0.0, 1.0)
+        return ssim.mean()
 
     def forward(
         self,
