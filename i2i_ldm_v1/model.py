@@ -142,12 +142,28 @@ class EMA:
                 self.shadow[name] = param.data.float().cpu().clone()
 
     @torch.no_grad()
-    def step(self, model: nn.Module):
-        """Update shadow weights with the current model parameters."""
+    def step(self, model: nn.Module, step: int = 0):
+        """
+        Update shadow weights with the current model parameters.
+
+        Uses an adaptive decay that ramps up from ~0.1 at step 0 to the
+        target decay asymptotically.  Formula: min(target, (1+step)/(10+step)).
+
+        Without this, decay=0.9999 means the shadow weights are still
+        74% random initialisation at step 3000 (0.9999^3000 = 0.74).
+        Sampling with those weights produces pure noise even when the live
+        model has converged.  The adaptive formula gives:
+          step    0  →  decay ≈ 0.09  (fast tracking of live weights)
+          step 1000  →  decay ≈ 0.990
+          step 5000  →  decay ≈ 0.998
+          step 10000 →  decay ≈ 0.999  (approaching target 0.9999)
+        """
+        # Adaptive decay: fast early, slow (stable) late
+        effective_decay = min(self.decay, (1.0 + step) / (10.0 + step))
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(
-                    param.data.float().cpu(), alpha=1.0 - self.decay
+                self.shadow[name].mul_(effective_decay).add_(
+                    param.data.float().cpu(), alpha=1.0 - effective_decay
                 )
 
     def apply_shadow(self, model: nn.Module):
@@ -484,11 +500,23 @@ class SSIMLoss(nn.Module):
         """
         Computes 1 - SSIM(luma(pred), luma(reference)).
         pred, reference: (B, 3, H, W) in [-1, 1]
+
+        Mean-shift pred's luminance to match reference before computing SSIM.
+        This removes the SSIM luminance term (2μₓμᵧ+C1)/(μₓ²+μᵧ²+C1) from
+        the loss, because that term penalises global brightness differences —
+        which is exactly the change we want the model to make for exposure.
+        After mean-shifting, SSIM measures only texture/edge structure fidelity.
         """
         pred      = pred.to(self.device)
         reference = reference.to(self.device)
-        luma_p = self._rgb_to_luminance(pred)
-        luma_r = self._rgb_to_luminance(reference)
+        luma_p = self._rgb_to_luminance(pred)       # (B,1,H,W)
+        luma_r = self._rgb_to_luminance(reference)  # (B,1,H,W)
+
+        # Shift pred's mean to match reference so SSIM ignores brightness delta
+        mean_p = luma_p.mean(dim=[2, 3], keepdim=True)
+        mean_r = luma_r.mean(dim=[2, 3], keepdim=True)
+        luma_p = luma_p - mean_p + mean_r   # same mean, different texture
+
         return 1.0 - self._ssim(luma_p, luma_r)
 
 

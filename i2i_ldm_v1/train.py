@@ -562,6 +562,7 @@ def train():
             low_noise_mask = (timesteps < cfg.aux_loss_t_max)
             apply_aux = (
                 vae is not None
+                and global_step >= cfg.aux_loss_start_step  # diffusion must stabilise first
                 and (cfg.USE_LPIPS or cfg.USE_SSIM or cfg.USE_CHROMA
                      or cfg.USE_HIST or cfg.USE_EXPOSURE)
                 and low_noise_mask.any()
@@ -632,13 +633,23 @@ def train():
 
         # ── EMA update (after each optimiser step) ────────────────────────────
         if ema is not None and accelerator.sync_gradients:
-            ema.step(accelerator.unwrap_model(unet))
+            # Pass global_step so EMA uses adaptive decay (fast early, slow late)
+            ema.step(accelerator.unwrap_model(unet), step=global_step)
 
         # ── Running loss window ───────────────────────────────────────────────
         loss_window.append(loss_dict["loss/total"])
         if len(loss_window) > WINDOW_SIZE:
             loss_window.pop(0)
         smoothed_loss = sum(loss_window) / len(loss_window)
+
+        # ── Notify when aux losses become active ─────────────────────────────
+        if global_step == cfg.aux_loss_start_step and accelerator.is_main_process:
+            log.info(
+                f"[step {global_step}] Auxiliary losses now active "
+                f"(LPIPS={cfg.USE_LPIPS}, SSIM={cfg.USE_SSIM}, "
+                f"chroma={cfg.USE_CHROMA}, exposure={cfg.USE_EXPOSURE}). "
+                f"t_max={cfg.aux_loss_t_max}"
+            )
 
         # ── Console + WandB scalar logging ───────────────────────────────────
         if global_step % 50 == 0 and accelerator.is_main_process:

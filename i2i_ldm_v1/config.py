@@ -124,17 +124,12 @@ def _profile(tier: str) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 class TrainConfig:
     # Paths
-    #data_dir_normal = "../../../data/datasets/ead_2020_classified/edm2020_classified/normal_frames"
-    #data_dir_over   = "../../../data/datasets/ead_2020_classified/edm2020_classified/overexposed_frames"
-    #data_dir_under  = "../../../data/datasets/ead_2020_classified/edm2020_classified/underexposed_frames"
-
-    data_dir_normal = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
-    data_dir_over   = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
-    data_dir_under  = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"
-
-    output_dir      = "../../../projects/i2i_ldm_v2/checkpoints"
-    samples_dir     = "../../../projects/i2i_ldm_v2/samples"
-    log_dir         = "../../../projects/i2i_ldm_v2/logs"
+    data_dir_normal = "data/normal"
+    data_dir_over   = "data/overexposed"
+    data_dir_under  = "data/underexposed"
+    output_dir      = "checkpoints"
+    samples_dir     = "samples"
+    log_dir         = "logs"
 
     # Pretrained VAE (SD 1.5 VAE — frozen, used only for encode/decode)
     # Set to None to skip downloading and use a simple pixel-space fallback
@@ -194,10 +189,18 @@ class TrainConfig:
     USE_HIST       = False
     USE_EXPOSURE   = True
 
-    # Auxiliary losses are only meaningful when x0 is estimated from
-    # low-to-mid noise steps (otherwise x0 is dominated by noise).
+    # Auxiliary losses are only applied after the diffusion backbone has
+    # had time to learn basic denoising.  Before aux_loss_start_step, only
+    # the pure diffusion MSE loss trains the UNet.  Applying perceptual losses
+    # on random x0 estimates (early training) adds noise to the gradient and
+    # can slow down or destabilise convergence.
+    aux_loss_start_step = 2_000   # wait for diffusion to stabilise first
+
     # Only apply aux losses when the diffusion timestep t < aux_loss_t_max.
-    aux_loss_t_max = 600   # skip aux losses for t >= this threshold
+    # x0 estimated at t=600 still has SNR < 1 — the estimate is dominated by
+    # noise and makes perceptual losses meaningless.  t=250 gives SNR > 4,
+    # producing x0 estimates good enough for meaningful LPIPS/SSIM gradients.
+    aux_loss_t_max = 250   # was 600 — reduced to ensure clean x0 estimates
 
     # Optimiser
     learning_rate    = 1e-4
