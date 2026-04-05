@@ -1,0 +1,44 @@
+# configs/train.yaml  — DGX / 16GB GPU full training
+experiment_name: "illumination_diffusion_v1"
+output_dir: "../../../projects/i2i_paired_v1/train"
+seed: 42
+
+# ── Data ──────────────────────────────────────────────────────────────
+data:
+  underexposed_root: "../../../data/datasets/endo4ie/real_underexposed"
+  overexposed_root:  "../../../data/datasets/endo4ie/real_overexposed"
+  image_size: 256
+  num_workers: 4
+
+# ── Model ─────────────────────────────────────────────────────────────
+model:
+  base_channels: 128
+  channel_multipliers: [1, 2, 4, 8]
+  num_res_blocks: 2
+  attention_resolutions: [32, 16, 8]
+  dropout: 0.1
+  timesteps: 1000
+  prediction_type: "v_prediction"
+  use_ema: true
+  ema_decay: 0.9999
+
+# ── Training ──────────────────────────────────────────────────────────
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 4      # effective batch = 16
+  num_epochs: 200
+  learning_rate: 2.0e-5
+  lr_warmup_steps: 500
+  save_every_n_epochs: 10
+  log_every_n_steps: 50
+  mixed_precision: "fp16"             # AMP for 16GB GPU
+  max_grad_norm: 1.0
+  # Loss weights
+  mse_weight: 1.0
+  perceptual_weight: 0.1              # VGG perceptual loss
+  use_wandb: true
+
+# ── Inference ─────────────────────────────────────────────────────────
+inference:
+  num_inference_steps: 50
+  ddim_eta: 0.0                       # deterministic DDIM
