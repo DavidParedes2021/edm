@@ -124,12 +124,17 @@ def _profile(tier: str) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 class TrainConfig:
     # Paths
-    data_dir_normal = "data/normal"
-    data_dir_over   = "data/overexposed"
-    data_dir_under  = "data/underexposed"
-    output_dir      = "checkpoints"
-    samples_dir     = "samples"
-    log_dir         = "logs"
+    #data_dir_normal = "../../../data/datasets/ead_2020_classified/edm2020_classified/normal_frames"
+    #data_dir_over   = "../../../data/datasets/ead_2020_classified/edm2020_classified/overexposed_frames"
+    #data_dir_under  = "../../../data/datasets/ead_2020_classified/edm2020_classified/underexposed_frames"
+
+    data_dir_normal = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
+    data_dir_over   = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
+    data_dir_under  = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"
+
+    output_dir      = "../../../projects/i2i_ldm_v2/checkpoints"
+    samples_dir     = "../../../projects/i2i_ldm_v2/samples"
+    log_dir         = "../../../projects/i2i_ldm_v2/logs"
 
     # Pretrained VAE (SD 1.5 VAE — frozen, used only for encode/decode)
     # Set to None to skip downloading and use a simple pixel-space fallback
