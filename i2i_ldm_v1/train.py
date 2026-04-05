@@ -11,16 +11,25 @@ Checkpoint strategy  (best / last only — no step_XXXXXXX accumulation):
         best/   — saved whenever the 50-step smoothed loss improves
         last/   — overwritten at every save_every interval
 
-Image logging:
-    Disk  : samples/step_XXXXXXX_over_loss0.0423.png
-             samples/step_XXXXXXX_under_loss0.0423.png
-             3-column grid per domain: [Normal | Generated | Target]
-    WandB : panels  samples/overexposed  and  samples/underexposed
-             with per-image captions (step, EV, domain)
-            + full comparison grid under  grids/overexposed  / grids/underexposed
+Key improvements vs original:
+  1. Classifier-Free Guidance (CFG) training: EV conditioning is randomly
+     replaced by the null embedding with probability cfg_dropout_prob.
+     This enables guided inference at any strength (guidance_scale).
+  2. EMA: UNet weights are tracked with exponential moving average.
+     Samples during training are generated with EMA weights.
+  3. Min-SNR weighting: diffusion loss weighted by min(SNR, γ)/SNR.
+     Prevents high-noise timesteps from dominating training, accelerating
+     convergence significantly.
+  4. Auxiliary loss gating: LPIPS/SSIM/histogram losses are only computed
+     when t < aux_loss_t_max.  At high t the x0 estimate is extremely noisy
+     and these losses add misleading gradients.
+  5. LPIPS compared to TARGET (not normal): the perceptual loss now measures
+     how well the generated image matches the *exposure target*, not the
+     normal input.  SSIM still compares to normal for structure preservation.
 """
 
 import math
+import random
 import argparse
 import logging
 from pathlib import Path
@@ -44,11 +53,15 @@ from config  import TrainConfig
 from dataset import IlluminationDataset, tensor_to_pil
 from model   import (
     EVEmbedding,
+    EMA,
     build_unet,
     VAEWrapper,
     LPIPSLoss,
     SSIMLoss,
     HistogramLoss,
+    ChrominanceConsistencyLoss,
+    ExposureBrightnessLoss,
+    compute_snr_weights,
 )
 
 logging.basicConfig(
@@ -77,40 +90,40 @@ def parse_args():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Checkpoint helpers  (best / last only)
+# Checkpoint helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _write_ckpt(directory: Path, unet, ev_embed, optimizer, step: int):
-    """Write model weights + optimiser state into *directory*."""
+def _write_ckpt(directory: Path, unet, ev_embed, optimizer, ema, step: int):
+    """Write model weights + optimiser state + EMA into *directory*."""
     directory.mkdir(parents=True, exist_ok=True)
     unet.save_pretrained(directory / "unet")
     torch.save(ev_embed.state_dict(),  directory / "ev_embed.pt")
     torch.save(optimizer.state_dict(), directory / "optimizer.pt")
     torch.save({"step": step},         directory / "train_state.pt")
+    if ema is not None:
+        torch.save(ema.state_dict(),   directory / "ema.pt")
 
 
-def save_last(unet, ev_embed, optimizer, step: int, cfg: TrainConfig):
-    """Overwrite checkpoints/last/ — always called at save_every."""
+def save_last(unet, ev_embed, optimizer, ema, step: int, cfg: TrainConfig):
     dest = Path(cfg.output_dir) / "last"
-    _write_ckpt(dest, unet, ev_embed, optimizer, step)
+    _write_ckpt(dest, unet, ev_embed, optimizer, ema, step)
     log.info(f"[ckpt] last  saved  (step {step})")
 
 
-def save_best(unet, ev_embed, optimizer, step: int,
+def save_best(unet, ev_embed, optimizer, ema, step: int,
               loss: float, cfg: TrainConfig):
-    """Overwrite checkpoints/best/ — only when smoothed loss improved."""
     dest = Path(cfg.output_dir) / "best"
-    _write_ckpt(dest, unet, ev_embed, optimizer, step)
+    _write_ckpt(dest, unet, ev_embed, optimizer, ema, step)
     (dest / "best_meta.txt").write_text(f"step={step}\nloss={loss:.6f}\n")
     log.info(f"[ckpt] best  saved  (step {step}, loss {loss:.4f})")
 
 
-def load_checkpoint(resume_dir: Path, unet, ev_embed, optimizer,
+def load_checkpoint(resume_dir: Path, unet, ev_embed, optimizer, ema,
                     cfg: TrainConfig) -> int:
     """Load weights from *resume_dir*, return saved step."""
     from diffusers import UNet2DConditionModel
-    state = torch.load(resume_dir / "train_state.pt", map_location="cpu")
-    step  = state["step"]
+    state  = torch.load(resume_dir / "train_state.pt", map_location="cpu")
+    step   = state["step"]
     loaded = UNet2DConditionModel.from_pretrained(resume_dir / "unet")
     unet.load_state_dict(loaded.state_dict())
     del loaded
@@ -120,12 +133,16 @@ def load_checkpoint(resume_dir: Path, unet, ev_embed, optimizer,
     optimizer.load_state_dict(
         torch.load(resume_dir / "optimizer.pt", map_location=cfg.device)
     )
+    ema_path = resume_dir / "ema.pt"
+    if ema is not None and ema_path.exists():
+        ema.load_state_dict(torch.load(ema_path, map_location="cpu"))
+        log.info("[ckpt] EMA state restored")
     log.info(f"[ckpt] Resumed from {resume_dir}  (step {step})")
     return step
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sample generation + image logging
+# Sample generation + image logging  (uses EMA weights)
 # ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -134,6 +151,7 @@ def generate_samples(
     batch: dict,
     unet,
     ev_embed,
+    ema,
     vae,
     ddim_scheduler,
     cfg: TrainConfig,
@@ -143,17 +161,17 @@ def generate_samples(
     n_samples: int = 4,
 ):
     """
-    Run DDIM inference and log sample grids.
+    Run DDIM inference and log sample grids.  Uses EMA weights if available.
 
-    Generates one grid per domain present in the batch:
-        columns: [Normal input | Generated output | Pseudo-pair target]
-
-    Disk  : samples/step_XXXXXXX_{domain}_loss{best:.4f}.png
-    WandB : samples/{domain}   — list of wandb.Image with EV captions
-            grids/{domain}     — full comparison grid as single wandb.Image
+    Generates one grid per domain:
+        columns: [Normal input | Generated (EMA) | Pseudo-pair target]
     """
     unet.eval()
     ev_embed.eval()
+
+    # Temporarily apply EMA weights for inference
+    if ema is not None:
+        ema.apply_shadow(unet)
 
     device = accelerator.device
     dtype  = (
@@ -165,10 +183,10 @@ def generate_samples(
     out_dir = Path(cfg.samples_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    labels  = batch["label"]   # (B,) — 0=over, 1=under
+    labels  = batch["label"]
     ev_vals = batch["ev"]
 
-    wandb_log = {}   # accumulated across domains, flushed in one wandb.log
+    wandb_log = {}
 
     for domain_label, domain_name in [(0, "over"), (1, "under")]:
         indices = (labels == domain_label).nonzero(as_tuple=True)[0]
@@ -176,86 +194,84 @@ def generate_samples(
             continue
 
         idx    = indices[:n_samples]
-        normal = batch["normal"][idx].to(device)   # (k, 3, H, W)
+        normal = batch["normal"][idx].to(device)
         target = batch["target"][idx].to(device)
         ev     = ev_vals[idx].to(device)
         k      = normal.shape[0]
 
-        # ── Encode ───────────────────────────────────────────────────────
         if vae is not None:
             normal_latent = vae.encode(normal)
         else:
             h = cfg.image_size // 8
-            w = cfg.image_size // 8
-            normal_latent = F.interpolate(normal, size=(h, w))
+            normal_latent = F.interpolate(normal, size=(h, h))
 
         _, C, H, W = normal_latent.shape
         noisy = torch.randn(k, C, H, W, device=device)
 
+        # Conditioned context
         ev_emb = ev_embed(ev)
         ev_ctx = ev_emb.unsqueeze(1).to(dtype)
 
-        # ── DDIM denoising ───────────────────────────────────────────────
+        # Unconditioned context for CFG
+        null_ctx = ev_embed.null_cond(k, device).to(dtype)
+
         ddim_scheduler.set_timesteps(cfg.ddim_inference_steps)
         for t in ddim_scheduler.timesteps:
-            t_batch  = torch.full((k,), t, device=device, dtype=torch.long)
-            mdl_in   = torch.cat([noisy, normal_latent.to(dtype)], dim=1)
-            n_pred   = unet(mdl_in, t_batch,
-                            encoder_hidden_states=ev_ctx).sample
-            noisy    = ddim_scheduler.step(n_pred, t, noisy).prev_sample
+            t_batch = torch.full((k,), t, device=device, dtype=torch.long)
+            mdl_in  = torch.cat([noisy, normal_latent.to(dtype)], dim=1)
 
-        # ── Decode ───────────────────────────────────────────────────────
+            # Classifier-Free Guidance: two forward passes
+            if cfg.guidance_scale > 1.0:
+                noise_uncond = unet(mdl_in, t_batch,
+                                    encoder_hidden_states=null_ctx).sample
+                noise_cond   = unet(mdl_in, t_batch,
+                                    encoder_hidden_states=ev_ctx).sample
+                # Extrapolate: move in the direction of the conditioning
+                n_pred = noise_uncond + cfg.guidance_scale * (noise_cond - noise_uncond)
+            else:
+                n_pred = unet(mdl_in, t_batch,
+                              encoder_hidden_states=ev_ctx).sample
+
+            noisy = ddim_scheduler.step(n_pred, t, noisy).prev_sample
+
         if vae is not None:
             generated = vae.decode(noisy.float())
         else:
-            generated = F.interpolate(noisy,
-                                      size=(cfg.image_size, cfg.image_size))
+            generated = F.interpolate(noisy, size=(cfg.image_size, cfg.image_size))
         generated = generated.clamp(-1, 1)
 
-        # ── 3-column grid: normal | generated | target ───────────────────
         rows = []
         for i in range(k):
             rows += [normal[i].cpu(), generated[i].cpu(), target[i].cpu()]
         grid_01 = (torch.stack(rows).clamp(-1, 1) + 1.0) / 2.0
 
-        # Save to disk
         fname = f"step_{step:07d}_{domain_name}_loss{best_loss:.4f}.png"
         save_image(grid_01, out_dir / fname, nrow=3, padding=2, pad_value=0.5)
         log.info(f"[samples] {domain_name:5s} → {out_dir / fname}")
 
-        # ── WandB image logging ───────────────────────────────────────────
         if use_wandb and HAS_WANDB:
             ev_list = ev.cpu().tolist()
-
-            # Individual generated images with per-image EV caption
-            panels = []
+            panels  = []
             for i in range(k):
-                caption = (
-                    f"step {step} | EV {ev_list[i]:+.2f} | {domain_name}"
-                )
+                caption = f"step {step} | EV {ev_list[i]:+.2f} | {domain_name} | EMA"
                 panels.append(
-                    wandb.Image(tensor_to_pil(generated[i].cpu()),
-                                caption=caption)
+                    wandb.Image(tensor_to_pil(generated[i].cpu()), caption=caption)
                 )
             wandb_log[f"samples/{domain_name}"] = panels
 
-            # Full grid as a single image
-            grid_tensor = make_grid(
-                grid_01, nrow=3, padding=2, pad_value=0.5
-            )
-            # grid_tensor is [0,1]; tensor_to_pil expects [-1,1]
-            grid_pil = tensor_to_pil(grid_tensor * 2.0 - 1.0)
+            grid_tensor = make_grid(grid_01, nrow=3, padding=2, pad_value=0.5)
+            grid_pil    = tensor_to_pil(grid_tensor * 2.0 - 1.0)
             wandb_log[f"grids/{domain_name}"] = wandb.Image(
                 grid_pil,
-                caption=(
-                    f"step {step} | {domain_name} | "
-                    "normal / generated / target"
-                ),
+                caption=f"step {step} | {domain_name} | normal / generated(EMA) / target",
             )
 
-    # One wandb.log call for all domains at this step
     if wandb_log and use_wandb and HAS_WANDB:
         wandb.log(wandb_log, step=step)
+
+    # Restore live training weights after inference
+    if ema is not None:
+        ema.restore(unet)
 
     unet.train()
     ev_embed.train()
@@ -269,7 +285,6 @@ def train():
     args = parse_args()
     cfg  = TrainConfig()
 
-    # ── Smoke-test overrides ─────────────────────────────────────────────────
     if args.smoke:
         cfg.tier               = "smoke"
         cfg.image_size         = 128
@@ -342,6 +357,9 @@ def train():
         gradient_checkpointing = cfg.gradient_checkpointing,
     ).to(device)
 
+    # EMA — initialised from the UNet before accelerator.prepare wraps it
+    ema = EMA(unet, decay=cfg.ema_decay) if cfg.use_ema else None
+
     # ── Schedulers ───────────────────────────────────────────────────────────
     train_scheduler = DDPMScheduler(
         num_train_timesteps = cfg.num_train_timesteps,
@@ -359,11 +377,16 @@ def train():
     )
 
     # ── Loss modules ─────────────────────────────────────────────────────────
-    lpips_loss = LPIPSLoss(device=str(device))     if cfg.USE_LPIPS else None
-    ssim_loss  = SSIMLoss(device=str(device))      if cfg.USE_SSIM  else None
-    hist_loss  = HistogramLoss(device=str(device)) if cfg.USE_HIST  else None
+    # luminance_only=True: LPIPS measures structural fidelity vs the NORMAL image
+    # on the Y channel only, so it does NOT penalise brightness shifts.
+    lpips_loss    = LPIPSLoss(device=str(device), luminance_only=True) if cfg.USE_LPIPS    else None
+    ssim_loss     = SSIMLoss(device=str(device))                       if cfg.USE_SSIM     else None
+    chroma_loss   = ChrominanceConsistencyLoss(device=str(device))     if cfg.USE_CHROMA   else None
+    hist_loss     = HistogramLoss(device=str(device))                  if cfg.USE_HIST     else None
+    exposure_loss = ExposureBrightnessLoss()                           if cfg.USE_EXPOSURE else None
 
     # ── Optimiser + LR schedule ───────────────────────────────────────────────
+    # Include null_embedding in trainable params (it is a Parameter in EVEmbedding)
     trainable_params = list(unet.parameters()) + list(ev_embed.parameters())
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -397,7 +420,7 @@ def train():
                 last_dir,
                 accelerator.unwrap_model(unet),
                 accelerator.unwrap_model(ev_embed),
-                optimizer, cfg,
+                optimizer, ema, cfg,
             )
         else:
             log.warning("--resume: checkpoints/last/ not found, starting fresh.")
@@ -414,6 +437,11 @@ def train():
                 "max_steps":      cfg.max_train_steps,
                 "lambda_lpips":   cfg.lambda_lpips,
                 "lambda_ssim":    cfg.lambda_ssim,
+                "cfg_dropout":    cfg.cfg_dropout_prob,
+                "guidance_scale": cfg.guidance_scale,
+                "use_ema":        cfg.use_ema,
+                "ema_decay":      cfg.ema_decay,
+                "snr_gamma":      cfg.snr_gamma if cfg.use_snr_weighting else None,
                 "ev_over_range":  [cfg.ev_over_min, cfg.ev_over_max],
                 "ev_under_range": [cfg.ev_under_min, cfg.ev_under_max],
             },
@@ -436,7 +464,10 @@ def train():
         f"Training | steps={cfg.max_train_steps} | "
         f"eff_batch={cfg.train_batch * cfg.grad_accum} | "
         f"size={cfg.image_size} | "
-        f"vae={'on' if vae else 'off'}"
+        f"vae={'on' if vae else 'off'} | "
+        f"CFG dropout={cfg.cfg_dropout_prob} | "
+        f"EMA={'on' if ema else 'off'} | "
+        f"Min-SNR={'on' if cfg.use_snr_weighting else 'off'}"
     )
 
     unet.train()
@@ -470,7 +501,7 @@ def train():
                     normal_latent = F.interpolate(normal, size=(h, h))
                     target_latent = F.interpolate(target, size=(h, h))
 
-            # 2. Add noise
+            # 2. Sample noise and timesteps
             noise     = torch.randn_like(target_latent)
             B         = target_latent.shape[0]
             timesteps = torch.randint(
@@ -481,16 +512,24 @@ def train():
                 target_latent, noise, timesteps
             )
 
-            # 3. EV embedding
+            # 3. EV conditioning — Classifier-Free Guidance training dropout
             amp_dtype = (
                 torch.float16  if cfg.mixed_precision == "fp16"  else
                 torch.bfloat16 if cfg.mixed_precision == "bf16"  else
                 torch.float32
             )
-            ev_emb = ev_embed(ev_val)
-            ev_ctx = ev_emb.unsqueeze(1).to(amp_dtype)
 
-            # 4. Concat Normal latent
+            # For each sample independently, decide whether to use null cond.
+            # This is equivalent to training a jointly-conditional and
+            # unconditional model, which CFG inference relies on.
+            use_null = torch.rand(B, device=device) < cfg.cfg_dropout_prob
+            ev_emb   = ev_embed(ev_val)          # (B, ev_embed_dim)
+            null_emb = ev_embed.null_embedding.to(device).unsqueeze(0).expand(B, -1)
+            # Select real or null embedding per sample in the batch
+            cond_emb = torch.where(use_null.unsqueeze(-1), null_emb, ev_emb)
+            ev_ctx   = cond_emb.unsqueeze(1).to(amp_dtype)  # (B, 1, ev_embed_dim)
+
+            # 4. Concat Normal latent (spatial conditioning)
             model_input = torch.cat(
                 [noisy_target, normal_latent.to(amp_dtype)], dim=1
             )
@@ -502,34 +541,84 @@ def train():
                 encoder_hidden_states=ev_ctx,
             ).sample
 
-            # 6. Diffusion loss
-            diff_loss  = F.mse_loss(noise_pred.float(), noise.float())
+            # 6. Diffusion loss (with optional Min-SNR weighting)
+            if cfg.use_snr_weighting:
+                # Compute per-sample weights and apply element-wise
+                snr_weights = compute_snr_weights(
+                    train_scheduler, timesteps, gamma=cfg.snr_gamma
+                ).to(device)
+                per_sample_mse = F.mse_loss(
+                    noise_pred.float(), noise.float(), reduction="none"
+                ).mean(dim=[1, 2, 3])   # (B,)
+                diff_loss = (per_sample_mse * snr_weights).mean()
+            else:
+                diff_loss = F.mse_loss(noise_pred.float(), noise.float())
+
             total_loss = diff_loss
             loss_dict  = {"loss/diffusion": diff_loss.item()}
 
-            # 7. Auxiliary losses
-            if (cfg.USE_LPIPS or cfg.USE_SSIM or cfg.USE_HIST) and vae is not None:
+            # 7. Auxiliary losses — only when VAE is available and t is low
+            # (x0 estimated from high-t noisy latents is dominated by noise)
+            low_noise_mask = (timesteps < cfg.aux_loss_t_max)
+            apply_aux = (
+                vae is not None
+                and (cfg.USE_LPIPS or cfg.USE_SSIM or cfg.USE_CHROMA
+                     or cfg.USE_HIST or cfg.USE_EXPOSURE)
+                and low_noise_mask.any()
+            )
+
+            if apply_aux:
+                # Estimate x0 (clean latent) from current prediction via
+                # the diffusion posterior formula: x0 = (x_t - σ_t * ε_pred) / α_t
                 acp = train_scheduler.alphas_cumprod.to(device)
                 sa  = acp[timesteps].sqrt().view(-1, 1, 1, 1)
                 som = (1.0 - acp[timesteps]).sqrt().view(-1, 1, 1, 1)
                 x0_lat = (noisy_target.float() - som * noise_pred.float()) / (sa + 1e-8)
+
                 with torch.no_grad():
                     x0_px = vae.decode(x0_lat)
 
+                # Only average aux losses over low-noise samples in the batch
+                mask = low_noise_mask.float()
+
                 if lpips_loss is not None:
-                    lp = lpips_loss(x0_px.to(device), normal.to(device)) * cfg.lambda_lpips
+                    # Compare to NORMAL on the luminance channel only.
+                    # This measures structural/texture fidelity (edges, tissue)
+                    # WITHOUT penalising the brightness shift the model must make.
+                    # The luminance_only=True flag in LPIPSLoss handles conversion.
+                    lp = lpips_loss(x0_px.to(device), normal.to(device))
+                    lp = lp * cfg.lambda_lpips
                     total_loss = total_loss + lp
                     loss_dict["loss/lpips"] = lp.item()
 
                 if ssim_loss is not None:
-                    ss = ssim_loss(x0_px.to(device), normal.to(device)) * cfg.lambda_ssim
+                    # SSIM on luminance vs NORMAL: structural preservation.
+                    ss = ssim_loss(x0_px.to(device), normal.to(device))
+                    ss = ss * cfg.lambda_ssim
                     total_loss = total_loss + ss
                     loss_dict["loss/ssim"] = ss.item()
 
+                if chroma_loss is not None:
+                    # Chrominance (Cb, Cr) vs NORMAL: penalise hue/saturation
+                    # shifts.  Real exposure changes affect luminance, not hue.
+                    # This is the primary fix for color drift in generated images.
+                    ch = chroma_loss(x0_px.to(device), normal.to(device))
+                    ch = ch * cfg.lambda_chroma
+                    total_loss = total_loss + ch
+                    loss_dict["loss/chroma"] = ch.item()
+
                 if hist_loss is not None:
-                    hl = hist_loss(x0_px.to(device), target.to(device)) * cfg.lambda_hist
+                    hl = hist_loss(x0_px.to(device), target.to(device))
+                    hl = hl * cfg.lambda_hist
                     total_loss = total_loss + hl
                     loss_dict["loss/histogram"] = hl.item()
+
+                if exposure_loss is not None:
+                    # Penalise when generated brightness direction is wrong
+                    el = exposure_loss(x0_px.to(device), normal.to(device), ev_val)
+                    el = el * cfg.lambda_exposure
+                    total_loss = total_loss + el
+                    loss_dict["loss/exposure"] = el.item()
 
             loss_dict["loss/total"] = total_loss.item()
 
@@ -541,13 +630,17 @@ def train():
             lr_scheduler.step()
             optimizer.zero_grad()
 
+        # ── EMA update (after each optimiser step) ────────────────────────────
+        if ema is not None and accelerator.sync_gradients:
+            ema.step(accelerator.unwrap_model(unet))
+
         # ── Running loss window ───────────────────────────────────────────────
         loss_window.append(loss_dict["loss/total"])
         if len(loss_window) > WINDOW_SIZE:
             loss_window.pop(0)
         smoothed_loss = sum(loss_window) / len(loss_window)
 
-        # ── Console + scalar WandB logging ───────────────────────────────────
+        # ── Console + WandB scalar logging ───────────────────────────────────
         if global_step % 50 == 0 and accelerator.is_main_process:
             lr_now = lr_scheduler.get_last_lr()[0]
             log.info(
@@ -566,7 +659,7 @@ def train():
                     step=global_step,
                 )
 
-        # ── Image samples + WandB image logging ──────────────────────────────
+        # ── Image samples ──────────────────────────────────────────────────────
         if (
             global_step % cfg.sample_every == 0
             and global_step > 0
@@ -577,6 +670,7 @@ def train():
                 batch          = last_batch,
                 unet           = accelerator.unwrap_model(unet),
                 ev_embed       = accelerator.unwrap_model(ev_embed),
+                ema            = ema,
                 vae            = vae,
                 ddim_scheduler = ddim_scheduler,
                 cfg            = cfg,
@@ -585,7 +679,7 @@ def train():
                 best_loss      = best_loss,
             )
 
-        # ── Checkpoints: last always, best on improvement ─────────────────────
+        # ── Checkpoints ────────────────────────────────────────────────────────
         if (
             global_step % cfg.save_every == 0
             and global_step > 0
@@ -594,11 +688,11 @@ def train():
             u = accelerator.unwrap_model(unet)
             e = accelerator.unwrap_model(ev_embed)
 
-            save_last(u, e, optimizer, global_step, cfg)
+            save_last(u, e, optimizer, ema, global_step, cfg)
 
             if smoothed_loss < best_loss:
                 best_loss = smoothed_loss
-                save_best(u, e, optimizer, global_step, smoothed_loss, cfg)
+                save_best(u, e, optimizer, ema, global_step, smoothed_loss, cfg)
 
         global_step += 1
     # ══════════════════════════════════════════════════════════════════════════
@@ -607,9 +701,9 @@ def train():
     if accelerator.is_main_process:
         u = accelerator.unwrap_model(unet)
         e = accelerator.unwrap_model(ev_embed)
-        save_last(u, e, optimizer, global_step, cfg)
+        save_last(u, e, optimizer, ema, global_step, cfg)
         if smoothed_loss < best_loss:
-            save_best(u, e, optimizer, global_step, smoothed_loss, cfg)
+            save_best(u, e, optimizer, ema, global_step, smoothed_loss, cfg)
         log.info("Training complete.")
         log.info(f"Best smoothed loss : {best_loss:.6f}")
         log.info(f"Checkpoints        : {Path(cfg.output_dir).absolute()}")

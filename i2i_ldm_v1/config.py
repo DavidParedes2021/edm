@@ -40,14 +40,14 @@ def _profile(tier: str) -> dict:
             image_size=64,
             train_batch=1,
             grad_accum=1,
-            mixed_precision="no",        # fp32 on CPU
+            mixed_precision="no",
             vae_encode_batch=1,
             unet_channels=(128, 256, 384, 512),
             unet_layers_per_block=1,
             latent_channels=4,
             save_every=50,
             sample_every=50,
-            max_train_steps=200,          # just verify loop
+            max_train_steps=200,
             gradient_checkpointing=False,
             dataloader_workers=0,
         ),
@@ -63,7 +63,7 @@ def _profile(tier: str) -> dict:
             latent_channels=4,
             save_every=100,
             sample_every=100,
-            max_train_steps=500,          # smoke-test: verify convergence starts
+            max_train_steps=500,
             gradient_checkpointing=True,
             dataloader_workers=2,
         ),
@@ -87,7 +87,7 @@ def _profile(tier: str) -> dict:
             tier=tier,
             image_size=512,
             train_batch=2,
-            grad_accum=4,                 # effective batch = 8
+            grad_accum=4,
             mixed_precision="fp16",
             vae_encode_batch=4,
             unet_channels=(256, 512, 768, 1024),
@@ -112,7 +112,7 @@ def _profile(tier: str) -> dict:
             save_every=2_000,
             sample_every=2_000,
             max_train_steps=100_000,
-            gradient_checkpointing=False,  # enough VRAM — faster without it
+            gradient_checkpointing=False,
             dataloader_workers=8,
         ),
     }
@@ -124,12 +124,17 @@ def _profile(tier: str) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 class TrainConfig:
     # Paths
-    data_dir_normal = "../../../data/datasets/ead_2020_classified/edm2020_classified/normal_frames"
-    data_dir_over   = "../../../data/datasets/ead_2020_classified/edm2020_classified/overexposed_frames"
-    data_dir_under  = "../../../data/datasets/ead_2020_classified/edm2020_classified/underexposed_frames"
-    output_dir      = "../../../projects/i2i_ldm_v1/checkpoints"
-    samples_dir     = "../../../projects/i2i_ldm_v1/samples"
-    log_dir         = "../../../projects/i2i_ldm_v1/logs"
+    #data_dir_normal = "../../../data/datasets/ead_2020_classified/edm2020_classified/normal_frames"
+    #data_dir_over   = "../../../data/datasets/ead_2020_classified/edm2020_classified/overexposed_frames"
+    #data_dir_under  = "../../../data/datasets/ead_2020_classified/edm2020_classified/underexposed_frames"
+
+    data_dir_normal = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
+    data_dir_over   = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
+    data_dir_under  = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"
+
+    output_dir      = "../../../projects/i2i_ldm_v2/checkpoints"
+    samples_dir     = "../../../projects/i2i_ldm_v2/samples"
+    log_dir         = "../../../projects/i2i_ldm_v2/logs"
 
     # Pretrained VAE (SD 1.5 VAE — frozen, used only for encode/decode)
     # Set to None to skip downloading and use a simple pixel-space fallback
@@ -143,34 +148,67 @@ class TrainConfig:
     ddim_inference_steps = 50
 
     # EV conditioning
-    # Continuous EV scalar range (stops). Over: positive, Under: negative.
     ev_over_min  =  1.5
     ev_over_max  =  3.0
     ev_under_min = -3.0
     ev_under_max = -1.5
-    ev_embed_dim = 256           # sinusoidal EV embedding dimension
+    ev_embed_dim = 256
 
-    # Loss weights
-    lambda_lpips   = 0.8         # perceptual loss — most important add-on
-    lambda_ssim    = 0.2         # SSIM on luminance channel
-    lambda_cycle   = 0.5         # cycle-consistency (only if USE_CYCLE=True)
-    lambda_hist    = 0.1         # histogram loss (only if USE_HIST=True)
+    # ── Classifier-Free Guidance (CFG) ──────────────────────────────────────
+    # During training, EV conditioning is randomly dropped with probability
+    # cfg_dropout and replaced with the null embedding.  At inference the model
+    # is run twice (conditioned + unconditioned) and the predictions are
+    # extrapolated: pred = uncond + guidance_scale * (cond - uncond).
+    #
+    # guidance_scale=1.0  → no guidance (equivalent to disabled CFG)
+    # guidance_scale=3-7  → recommended range for exposure generation
+    # guidance_scale>10   → strong conditioning, risk of mode collapse
+    cfg_dropout_prob = 0.10    # fraction of training steps using null cond
+    guidance_scale   = 5.0    # used only at inference; set in inference.py
+
+    # ── EMA ─────────────────────────────────────────────────────────────────
+    # Exponential Moving Average of the UNet parameters.  EMA weights are
+    # more stable and produce sharper outputs at inference.
+    use_ema          = True
+    ema_decay        = 0.9999
+
+    # ── Min-SNR loss weighting ───────────────────────────────────────────────
+    # Clips per-sample diffusion loss weight at γ / SNR(t).
+    # Prevents high-noise timesteps from dominating training.
+    # gamma=5 is the default from the Min-SNR paper.
+    use_snr_weighting = True
+    snr_gamma         = 5.0
+
+    # ── Auxiliary loss weights and gating ────────────────────────────────────
+    lambda_lpips   = 0.8
+    lambda_ssim    = 0.2
+    lambda_chroma  = 0.5   # chrominance consistency (new — fixes color shifts)
+    lambda_cycle   = 0.5   # disabled by default; enable once base is stable
+    lambda_hist    = 0.1
+    lambda_exposure = 0.3  # brightness direction loss
 
     USE_LPIPS      = True
     USE_SSIM       = True
-    USE_CYCLE      = False       # enable once base model is stable
-    USE_HIST       = False       # enable when you have pseudo-pairs
+    USE_CHROMA     = True  # new: penalise hue/saturation shifts vs normal
+    USE_CYCLE      = False
+    USE_HIST       = False
+    USE_EXPOSURE   = True
+
+    # Auxiliary losses are only meaningful when x0 is estimated from
+    # low-to-mid noise steps (otherwise x0 is dominated by noise).
+    # Only apply aux losses when the diffusion timestep t < aux_loss_t_max.
+    aux_loss_t_max = 600   # skip aux losses for t >= this threshold
 
     # Optimiser
-    learning_rate  = 1e-4
-    lr_warmup_steps = 500
-    adam_beta1     = 0.9
-    adam_beta2     = 0.999
-    adam_eps       = 1e-8
+    learning_rate    = 1e-4
+    lr_warmup_steps  = 500
+    adam_beta1       = 0.9
+    adam_beta2       = 0.999
+    adam_eps         = 1e-8
     adam_weight_decay = 1e-2
-    max_grad_norm  = 1.0
+    max_grad_norm    = 1.0
 
-    # W&B (set USE_WANDB=False to disable)
+    # W&B
     USE_WANDB      = True
     wandb_project  = "illumination-diffusion"
     wandb_run_name = "ldm-ev-conditioning"
@@ -187,4 +225,6 @@ class TrainConfig:
         print(f"[Config] Device tier: {self.tier} | "
               f"image_size={self.image_size} | "
               f"batch={self.train_batch} | "
-              f"mixed_precision={self.mixed_precision}")
+              f"mixed_precision={self.mixed_precision} | "
+              f"CFG dropout={self.cfg_dropout_prob} | "
+              f"EMA={'on' if self.use_ema else 'off'}")
