@@ -1,0 +1,70 @@
+# configs/laptop_debug.yaml
+# Safe for 4GB GPU (RTX 3050) — for verifying training starts
+
+experiment_name: "illumination_debug"
+seed: 42
+
+# ── Dataset paths (absolute or relative to where you run the script) ──────
+data:
+  normal_path: "../curated_edm2020_classified/normal_frames"     # 504 normal frames  (ground truth)
+  over_path:   "../curated_edm2020_classified/overexposed_frames"       # 281 overexposed frames (unpaired reference)
+  under_path:  "../curated_edm2020_classified/underexposed_frames"      # 817 underexposed frames (unpaired reference)
+  image_size: 128                  # small for laptop
+  num_workers: 2
+  pin_memory: false                # safer on laptop
+
+# ── Output paths ───────────────────────────────────────────────────────────
+output:
+  base_dir:     "./outputs/illumination_debug"   # root for all outputs
+  checkpoint_dir: "checkpoints"                  # relative to base_dir
+  samples_dir:    "samples"                      # relative to base_dir
+
+# Model
+model:
+  base_channels: 32        # reduced for 4GB
+  channel_multipliers: [1, 2, 4]
+  attention_resolutions: [16]
+  num_res_blocks: 1
+  dropout: 0.1
+  exposure_embed_dim: 128
+
+# Diffusion
+diffusion:
+  num_train_timesteps: 1000
+  beta_schedule: "squaredcos_cap_v2"
+  prediction_type: "epsilon"  # predict noise
+  cfg_dropout_rate: 0.15      # 15% unconditional
+  cfg_scale: 5.0              # guidance scale at inference
+
+# Training
+training:
+  batch_size: 2              # tiny for laptop
+  gradient_accumulation_steps: 4   # effective batch = 8
+  num_epochs: 5              # just enough to verify
+  learning_rate: 1.0e-4
+  lr_warmup_steps: 100
+  mixed_precision: "no"      # fp32 on laptop (safer)
+  gradient_clip_norm: 1.0
+  log_every: 10
+  save_every: 500
+  sample_every: 200
+  use_ema: false             # skip EMA on debug
+  best_metric: "exposure_visibility"   # metric tracked for best checkpoint (higher=better)
+                                       # alternatives: "ssim_vs_normal", "hist_kl_div" (lower=better)
+
+# Loss weights
+loss:
+  l1_weight: 1.0
+  perceptual_weight: 0.1    # VGG perceptual
+  gradient_weight: 0.05     # sharpness
+  histogram_weight: 0.2     # exposure control
+
+# Memory
+memory:
+  enable_gradient_checkpointing: true
+  max_split_size_mb: 512
+
+# Logging
+logging:
+  use_wandb: false           # disable wandb for local debug
+  project: "illumination-diffusion"

@@ -1,0 +1,79 @@
+# configs/dgx_train.yaml
+# Optimized for single GPU 16GB (DGX A100 slice)
+
+experiment_name: "illumination_ycldi_v1"
+seed: 42
+
+    data_dir_normal = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
+    data_dir_over   = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
+    data_dir_under  = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"
+
+    output_dir      = "../../../projects/i2i_ldm_v2/checkpoints"
+    samples_dir     = "../../../projects/i2i_ldm_v2/samples"
+    log_dir         = "../../../projects/i2i_ldm_v2/logs"
+
+# ── Dataset paths (absolute or relative to where you run the script) ──────
+data:
+  normal_path: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"    # 504 normal frames  (ground truth)
+  over_path:   "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"      # 281 overexposed frames (unpaired reference)
+  under_path:  "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"      # 817 underexposed frames (unpaired reference)
+  image_size: 256
+  num_workers: 8
+  pin_memory: true
+
+# ── Output paths ───────────────────────────────────────────────────────────
+output:
+  base_dir:       "../../../projects/i2i_decoupled_v1/outputs"  # root for all outputs
+  checkpoint_dir: "checkpoints"                       # relative to base_dir
+  samples_dir:    "samples"                           # relative to base_dir
+
+# Model
+model:
+  base_channels: 128
+  channel_multipliers: [1, 2, 4, 8]
+  attention_resolutions: [32, 16, 8]
+  num_res_blocks: 2
+  dropout: 0.1
+  exposure_embed_dim: 256
+
+# Diffusion
+diffusion:
+  num_train_timesteps: 1000
+  beta_schedule: "squaredcos_cap_v2"
+  prediction_type: "epsilon"
+  cfg_dropout_rate: 0.15
+  cfg_scale: 7.0
+
+# Training
+training:
+  batch_size: 8
+  gradient_accumulation_steps: 2    # effective batch = 16
+  num_epochs: 200
+  learning_rate: 2.0e-4
+  lr_warmup_steps: 500
+  mixed_precision: "fp16"           # AMP for 16GB
+  gradient_clip_norm: 1.0
+  log_every: 50
+  save_every: 2000
+  sample_every: 1000
+  use_ema: true
+  ema_decay: 0.9999
+  best_metric: "exposure_visibility"   # metric tracked for best checkpoint (higher=better)
+                                       # alternatives: "ssim_vs_normal", "hist_kl_div" (lower=better)
+
+# Loss weights
+loss:
+  l1_weight: 1.0
+  perceptual_weight: 0.5
+  gradient_weight: 0.1
+  histogram_weight: 0.3
+
+# Memory
+memory:
+  enable_gradient_checkpointing: true
+  max_split_size_mb: 1024
+
+# Logging
+logging:
+  use_wandb: true
+  project: "illumination-diffusion"

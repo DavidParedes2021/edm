@@ -1,0 +1,36 @@
+# requirements.txt
+# Pinned versions matching the DGX environment
+# Install with: pip install -r requirements.txt
+
+# Core diffusion framework
+diffusers==0.14.0
+accelerate==0.18.0
+transformers==4.27.4
+
+# HuggingFace hub
+huggingface_hub==0.25.2
+
+# Vision (VGG perceptual loss)
+# On DGX with CUDA 11.3:
+#   pip install torchvision==0.12.0+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
+# On laptop CPU/CUDA 11.x:
+#   pip install torchvision==0.12.0
+torchvision==0.12.0
+
+# Utilities
+numpy==1.23.5
+Pillow==9.5.0
+tqdm==4.65.0
+matplotlib==3.7.1
+packaging==23.1
+PyYAML>=6.0
+
+# Experiment tracking
+wandb==0.14.2
+
+# Optional: LPIPS metric (install separately if needed)
+# pip install lpips
+
+# NOTE: torch must be installed BEFORE this file.
+# DGX:    pip install torch==1.11.0+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
+# Laptop: pip install torch==1.11.0
