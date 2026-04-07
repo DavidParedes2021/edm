@@ -4,14 +4,6 @@
 experiment_name: "illumination_ycldi_v1"
 seed: 42
 
-    data_dir_normal = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
-    data_dir_over   = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
-    data_dir_under  = "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"
-
-    output_dir      = "../../../projects/i2i_ldm_v2/checkpoints"
-    samples_dir     = "../../../projects/i2i_ldm_v2/samples"
-    log_dir         = "../../../projects/i2i_ldm_v2/logs"
-
 # ── Dataset paths (absolute or relative to where you run the script) ──────
 data:
   normal_path: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"    # 504 normal frames  (ground truth)
