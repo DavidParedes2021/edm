@@ -137,10 +137,17 @@ class VGGPerceptualLoss(nn.Module):
     """
     def __init__(self, device: torch.device):
         super().__init__()
-        from torchvision.models import vgg16, VGG16_Weights
-
+        from torchvision.models import vgg16
         try:
+            from torchvision.models import VGG16_Weights
             vgg = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
+        except ImportError:
+            # torchvision < 0.13 — fall back to deprecated pretrained flag
+            try:
+                vgg = vgg16(pretrained=True)  # noqa: TOR001
+            except Exception:
+                print("[VGG] Warning: pretrained weights unavailable, using random init.")
+                vgg = vgg16(pretrained=False)  # noqa: TOR001
         except Exception:
             print("[VGG] Warning: pretrained weights unavailable, using random init.")
             vgg = vgg16(weights=None)
