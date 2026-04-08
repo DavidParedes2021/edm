@@ -49,9 +49,9 @@ training:
 
 checkpoint:
   output_dir: "../../../projects/i2i_decoupled_v2/outputs"
-  checkpoint_dir: "/checkpoints"
-  samples_dir: "/samples"
-  save_every_n_epochs: 10     # Save sample images
+  checkpoint_dir: "../../../projects/i2i_decoupled_v2/outputs/checkpoints"
+  samples_dir: "../../../projects/i2i_decoupled_v2/outputs/samples"
+  save_every_n_epochs: 1      # Save sample images every epoch
   log_every_n_steps: 50
 
 wandb:
