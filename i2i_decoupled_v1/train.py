@@ -169,7 +169,7 @@ def save_sample_grid(
     results = {}
     for label_val, label_name in [(0, "over"), (1, "under")]:
         labels = torch.full((n_samples,), label_val, dtype=torch.long, device=device)
-        with torch.amp.autocast("cuda", enabled=use_amp, dtype=dtype):
+        with torch.cuda.amp.autocast(enabled=use_amp):
             y_gen = ddim_sample(
                 model            = model,
                 scheduler        = ddim,
@@ -533,7 +533,7 @@ def train(cfg: dict, resume_path: Optional[str] = None):
             noisy = add_noise(scheduler, normal_y_norm, noise, timesteps)
 
             # ---- Model forward (AMP context) ----
-            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+            with torch.cuda.amp.autocast(enabled=use_amp):
                 pred_noise = model(
                     x              = noisy,
                     timesteps      = timesteps,
@@ -635,7 +635,7 @@ def train(cfg: dict, resume_path: Optional[str] = None):
                 v_ref_hist      = val_batch["ref_hist"]
 
                 with ema.average_parameters(model) if use_ema else _noop():
-                    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                    with torch.cuda.amp.autocast(enabled=use_amp):
                         pred_y = ddim_sample(
                             model           = model,
                             scheduler       = ddim_val,
