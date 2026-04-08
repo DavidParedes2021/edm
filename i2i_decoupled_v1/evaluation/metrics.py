@@ -117,7 +117,7 @@ def luminance_stats(y: torch.Tensor) -> Dict[str, float]:
     Basic luminance statistics.
     y: (B, 1, H, W) in [0, 1]
     """
-    y_flat = y.view(-1)
+    y_flat = y.view(-1).float()
     return {
         "mean":   y_flat.mean().item(),
         "std":    y_flat.std().item(),
