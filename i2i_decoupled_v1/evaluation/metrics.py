@@ -82,7 +82,7 @@ def ssim(
     C2 = (0.03 * data_range) ** 2
 
     device = pred.device
-    kernel = _gaussian_kernel(window_size, sigma).to(device)
+    kernel = _gaussian_kernel(window_size, sigma).to(device=device, dtype=pred.dtype)
 
     B, C, H, W = pred.shape
     # Process each channel separately
