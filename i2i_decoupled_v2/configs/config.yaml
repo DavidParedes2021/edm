@@ -1,0 +1,60 @@
+# =============================================================================
+# Illumination Diffusion Pipeline - Configuration
+# =============================================================================
+
+data:
+  normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" 
+  overexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
+  underexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" 
+  image_size: 256            # Training resolution (use 512 for DGX)
+  use_lab_space: true        # Apply diffusion only on L channel (LAB)
+  augment: true
+
+model:
+  # UNet backbone for conditional DDPM
+  in_channels: 1              # L channel only (luminance diffusion)
+  out_channels: 1
+  base_channels: 128          # Feature map width; increase to 192 on DGX
+  channel_mult: [1, 2, 3, 4]
+  attention_resolutions: [16, 8]
+  num_res_blocks: 2
+  dropout: 0.1
+  # Conditioning: 2 exposure classes (over=0, under=1)
+  num_classes: 2
+  use_fp16: true              # Mixed precision
+
+diffusion:
+  timesteps: 1000
+  beta_schedule: "cosine"     # Cosine schedule → sharper outputs
+  ddim_steps: 50              # Inference steps (DDIM, fast)
+  ddim_eta: 0.0               # Deterministic DDIM (eta=0)
+  # Exposure guidance
+  classifier_free_guidance_scale: 4.0  # Higher = stronger exposure shift
+
+training:
+  batch_size: 4               # 4 on RTX 3050; 16 on DGX
+  gradient_accumulation_steps: 8  # Effective batch = 32
+  learning_rate: 1.0e-4
+  num_epochs: 200
+  warmup_steps: 500
+  mixed_precision: true
+  grad_clip: 1.0
+  # Loss weights
+  lambda_diffusion: 1.0       # Core denoising loss
+  lambda_perceptual: 0.1      # VGG perceptual
+  lambda_exposure: 0.5        # Histogram / brightness enforcement
+  lambda_structure: 0.2       # SSIM structure preservation
+  # Classifier-free guidance training dropout
+  cfg_dropout_prob: 0.15      # Randomly drop class conditioning
+
+checkpoint:
+  output_dir: "../../../projects/i2i_decoupled_v2/outputs"
+  checkpoint_dir: "/checkpoints"
+  samples_dir: "/samples"
+  save_every_n_epochs: 10     # Save sample images
+  log_every_n_steps: 50
+
+wandb:
+  enabled: false              # Set true to enable W&B logging
+  project: "illum-diffusion"
+  run_name: "lab-ddpm-v1"
