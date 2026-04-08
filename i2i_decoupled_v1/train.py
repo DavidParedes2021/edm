@@ -165,19 +165,21 @@ def save_sample_grid(
     )
     ddim.set_timesteps(num_inference_steps)
 
+    use_amp = dtype == torch.float16
     results = {}
     for label_val, label_name in [(0, "over"), (1, "under")]:
         labels = torch.full((n_samples,), label_val, dtype=torch.long, device=device)
-        y_gen = ddim_sample(
-            model            = model,
-            scheduler        = ddim,
-            shape            = normal_y_norm.shape,
-            exposure_labels  = labels,
-            condition_images = normal_y_norm,
-            device           = device,
-            cfg_scale        = cfg_scale,
-            dtype            = dtype,
-        )
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=dtype):
+            y_gen = ddim_sample(
+                model            = model,
+                scheduler        = ddim,
+                shape            = normal_y_norm.shape,
+                exposure_labels  = labels,
+                condition_images = normal_y_norm,
+                device           = device,
+                cfg_scale        = cfg_scale,
+                dtype            = dtype,
+            )
         y_gen_01 = denormalize_luminance(y_gen)
         rgb_out  = replace_luminance(normal_rgb.float(), y_gen_01.float())
         results[label_name] = rgb_out.cpu()
@@ -531,7 +533,7 @@ def train(cfg: dict, resume_path: Optional[str] = None):
             noisy = add_noise(scheduler, normal_y_norm, noise, timesteps)
 
             # ---- Model forward (AMP context) ----
-            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 pred_noise = model(
                     x              = noisy,
                     timesteps      = timesteps,
@@ -633,16 +635,17 @@ def train(cfg: dict, resume_path: Optional[str] = None):
                 v_ref_hist      = val_batch["ref_hist"]
 
                 with ema.average_parameters(model) if use_ema else _noop():
-                    pred_y = ddim_sample(
-                        model           = model,
-                        scheduler       = ddim_val,
-                        shape           = v_normal_y_norm.shape,
-                        exposure_labels = v_label,
-                        condition_images= v_normal_y_norm,
-                        device          = device,
-                        cfg_scale       = difcfg["cfg_scale"],
-                        dtype           = amp_dtype,
-                    )
+                    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                        pred_y = ddim_sample(
+                            model           = model,
+                            scheduler       = ddim_val,
+                            shape           = v_normal_y_norm.shape,
+                            exposure_labels = v_label,
+                            condition_images= v_normal_y_norm,
+                            device          = device,
+                            cfg_scale       = difcfg["cfg_scale"],
+                            dtype           = amp_dtype,
+                        )
 
                 pred_y_01   = denormalize_luminance(pred_y)
                 normal_y_01 = val_batch["normal_y"].to(amp_dtype)
