@@ -45,10 +45,10 @@ from typing import Dict, Tuple
 def psnr(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> float:
     """
     Peak Signal-to-Noise Ratio.
-    pred, target: (B, C, H, W) in [0, max_val]
+    pred, target: (B, C, H, W) in [0, max_val] — any dtype
     Returns: scalar float (dB)
     """
-    mse = F.mse_loss(pred, target).item()
+    mse = F.mse_loss(pred.float(), target.float()).item()
     if mse == 0:
         return float("inf")
     return 10 * np.log10((max_val ** 2) / mse)
@@ -75,17 +75,20 @@ def ssim(
 ) -> float:
     """
     Structural Similarity Index (SSIM) — PyTorch native, no skimage dependency.
-    pred, target: (B, 1, H, W) or (B, 3, H, W) in [0, data_range]
+    pred, target: (B, 1, H, W) or (B, 3, H, W) in [0, data_range] — any dtype
     Returns: scalar float in [-1, 1]
     """
+    # Cast to fp32 — conv2d with fp16 kernel has precision issues on some builds
+    pred   = pred.detach().float()
+    target = target.detach().float()
+
     C1 = (0.01 * data_range) ** 2
     C2 = (0.03 * data_range) ** 2
 
     device = pred.device
-    kernel = _gaussian_kernel(window_size, sigma).to(device=device, dtype=pred.dtype)
+    kernel = _gaussian_kernel(window_size, sigma).to(device=device, dtype=torch.float32)
 
     B, C, H, W = pred.shape
-    # Process each channel separately
     kernel = kernel.expand(C, 1, window_size, window_size)
     pad = window_size // 2
 
@@ -96,8 +99,8 @@ def ssim(
     mu2_sq = mu2 ** 2
     mu12   = mu1 * mu2
 
-    sigma1_sq = F.conv2d(pred ** 2,    kernel, padding=pad, groups=C) - mu1_sq
-    sigma2_sq = F.conv2d(target ** 2,  kernel, padding=pad, groups=C) - mu2_sq
+    sigma1_sq = F.conv2d(pred ** 2,     kernel, padding=pad, groups=C) - mu1_sq
+    sigma2_sq = F.conv2d(target ** 2,   kernel, padding=pad, groups=C) - mu2_sq
     sigma12   = F.conv2d(pred * target, kernel, padding=pad, groups=C) - mu12
 
     ssim_map = (
@@ -115,16 +118,19 @@ def ssim(
 def luminance_stats(y: torch.Tensor) -> Dict[str, float]:
     """
     Basic luminance statistics.
-    y: (B, 1, H, W) in [0, 1]
+    y: (B, 1, H, W) in [0, 1] — any dtype (fp16/fp32 from AMP)
+
+    NOTE: .quantile() requires float32/float64 in all PyTorch versions.
+          Cast the whole tensor to float32 first, before any operation.
     """
-    y_flat = y.view(-1).float()
+    y_flat = y.detach().float().view(-1)   # fp16 → fp32 before anything else
     return {
-        "mean":   y_flat.mean().item(),
-        "std":    y_flat.std().item(),
-        "p5":     y_flat.quantile(0.05).item(),   # dark shadows
-        "p95":    y_flat.quantile(0.95).item(),   # bright highlights
-        "saturated_frac": (y_flat > 0.95).float().mean().item(),  # blown highlights
-        "crushed_frac":   (y_flat < 0.05).float().mean().item(),  # crushed shadows
+        "mean":           y_flat.mean().item(),
+        "std":            y_flat.std().item(),
+        "p5":             y_flat.quantile(0.05).item(),
+        "p95":            y_flat.quantile(0.95).item(),
+        "saturated_frac": (y_flat > 0.95).float().mean().item(),
+        "crushed_frac":   (y_flat < 0.05).float().mean().item(),
     }
 
 
@@ -145,12 +151,13 @@ def exposure_visibility_score(
     For UNDER (label=1): mean(Y) should be < under_threshold
 
     Args:
-        y_generated: (B, 1, H, W) in [0, 1]
+        y_generated: (B, 1, H, W) in [0, 1] — any dtype
         label:       (B,) long — 0=over, 1=under
     Returns:
         accuracy: float in [0, 1]
     """
-    means = y_generated.view(y_generated.shape[0], -1).mean(dim=1)  # (B,)
+    # Cast to fp32 before spatial mean to avoid fp16 precision loss
+    means = y_generated.detach().float().view(y_generated.shape[0], -1).mean(dim=1)
     correct = 0
     for i in range(len(label)):
         if label[i] == 0 and means[i] > over_threshold:
@@ -174,11 +181,15 @@ def histogram_kl_divergence(
     KL divergence between predicted luminance histogram and reference.
     Lower = generated distribution more closely matches reference exposure.
 
-    pred:     (B, 1, H, W) in [0, 1]
+    pred:     (B, 1, H, W) in [0, 1] — any dtype (fp16/fp32)
     ref_hist: (B, 256) reference normalized histogram
     Returns:  scalar float
+
+    NOTE: torch.histc requires float32 on CUDA. Cast pred to fp32 at entry.
     """
-    B = pred.shape[0]
+    # Cast to fp32 — histc and log both need it; safe even if already fp32
+    pred_f = pred.detach().float()
+    B = pred_f.shape[0]
     total_kl = 0.0
 
     ref_hist_ds = F.interpolate(
@@ -190,12 +201,11 @@ def histogram_kl_divergence(
     ref_hist_ds = ref_hist_ds / (ref_hist_ds.sum(dim=1, keepdim=True) + eps)
 
     for b in range(B):
-        y_flat = pred[b].view(-1).clamp(0, 1)
+        y_flat = pred_f[b].view(-1).clamp(0.0, 1.0)
         hist = torch.histc(y_flat, bins=bins, min=0.0, max=1.0)
         hist = hist / (hist.sum() + eps)
 
-        ref = ref_hist_ds[b].to(pred.device)
-        # KL(P||Q) = sum P * log(P/Q)
+        ref = ref_hist_ds[b].to(pred_f.device)
         kl = (hist * (torch.log(hist + eps) - torch.log(ref + eps))).sum()
         total_kl += kl.item()
 
