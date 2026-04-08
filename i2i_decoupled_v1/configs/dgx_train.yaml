@@ -35,7 +35,7 @@ diffusion:
   beta_schedule: "squaredcos_cap_v2"
   prediction_type: "epsilon"
   cfg_dropout_rate: 0.15
-  cfg_scale: 7.0
+  cfg_scale: 9.0
 
 # Training
 training:
@@ -59,7 +59,7 @@ loss:
   l1_weight: 1.0
   perceptual_weight: 0.5
   gradient_weight: 0.1
-  histogram_weight: 0.3
+  histogram_weight: 0.5
 
 # Memory
 memory:

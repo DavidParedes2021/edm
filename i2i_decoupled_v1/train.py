@@ -673,6 +673,32 @@ def train(cfg: dict, resume_path: Optional[str] = None):
             f"Hist KL: {val_metrics.get('hist_kl_div', 0):.4f}"
         )
 
+        # ---- Per-epoch sample image ----
+        try:
+            with ema.average_parameters(model) if use_ema else _noop():
+                save_sample_grid(
+                    model               = model,
+                    scheduler           = scheduler,
+                    val_batch           = val_batch_fixed,
+                    device              = device,
+                    save_path           = sample_dir / f"epoch_{epoch+1:04d}.png",
+                    cfg_scale           = difcfg["cfg_scale"],
+                    num_inference_steps = 20,
+                    dtype               = amp_dtype,
+                )
+            logger.info(f"  Sample image → {sample_dir}/epoch_{epoch+1:04d}.png")
+            empty_cache()
+        except Exception as e:
+            logger.warning(f"Per-epoch sample generation failed: {e}")
+
+        # ---- Checkpoint: save "last" every epoch ----
+        ckpt_manager.save_last(
+            model=model, optimizer=optimizer,
+            lr_scheduler=lr_scheduler, scaler=scaler,
+            ema=ema, global_step=global_step,
+            epoch=epoch, cfg=cfg,
+        )
+
         # ---- Checkpoint: save "best" if metric improved ----
         improved = ckpt_manager.save_best_if_improved(
             model=model, optimizer=optimizer,
@@ -688,7 +714,11 @@ def train(cfg: dict, resume_path: Optional[str] = None):
 
         if use_wandb:
             import wandb
-            wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
+            wandb_log = {f"val/{k}": v for k, v in val_metrics.items()}
+            sample_path = sample_dir / f"epoch_{epoch+1:04d}.png"
+            if sample_path.exists():
+                wandb_log["val/sample"] = wandb.Image(str(sample_path))
+            wandb.log(wandb_log, step=global_step)
 
         log_gpu_memory(f"epoch {epoch+1} end")
 
