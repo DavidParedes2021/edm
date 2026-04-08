@@ -6,16 +6,16 @@ seed: 42
 
 # ── Dataset paths (absolute or relative to where you run the script) ──────
 data:
-  normal_path: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"    # 504 normal frames  (ground truth)
-  over_path:   "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"      # 281 overexposed frames (unpaired reference)
-  under_path:  "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"      # 817 underexposed frames (unpaired reference)
+  normal_path: "./data/normal"     # 504 normal frames  (ground truth)
+  over_path:   "./data/over"       # 281 overexposed frames (unpaired reference)
+  under_path:  "./data/under"      # 817 underexposed frames (unpaired reference)
   image_size: 256
   num_workers: 8
   pin_memory: true
 
 # ── Output paths ───────────────────────────────────────────────────────────
 output:
-  base_dir:       "../../../projects/i2i_decoupled_v1/outputs"  # root for all outputs
+  base_dir:       "./outputs/illumination_ycldi_v1"  # root for all outputs
   checkpoint_dir: "checkpoints"                       # relative to base_dir
   samples_dir:    "samples"                           # relative to base_dir
 
@@ -38,8 +38,8 @@ diffusion:
 
 # Training
 training:
-  batch_size: 8
-  gradient_accumulation_steps: 2    # effective batch = 16
+  batch_size: 4
+  gradient_accumulation_steps: 4    # effective batch = 16
   num_epochs: 200
   learning_rate: 2.0e-4
   lr_warmup_steps: 500

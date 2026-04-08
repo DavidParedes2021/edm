@@ -42,9 +42,7 @@ from tqdm import tqdm
 def _set_memory_config(max_split_size_mb: int):
     val = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
     if not val:
-        # max_split_size_mb:32 lets the allocator split free blocks for small allocations,
-        # reducing fragmentation that causes bad_alloc on Windows (PyTorch 2.x).
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = f"max_split_size_mb:{max_split_size_mb}"
 
 
 # ---------------------------------------------------------------------------

@@ -197,19 +197,19 @@ class VGGPerceptualLoss(nn.Module):
         pred_3   = self._normalize(pred_3)
         target_3 = self._normalize(target_3)
 
-        loss = 0.0
-        # Slice 1
-        f_pred   = self.slice1(pred_3)
-        f_target = self.slice1(target_3)
-        loss += F.l1_loss(f_pred, f_target)
-        # Slice 2
-        f_pred   = self.slice2(f_pred)
-        f_target = self.slice2(f_target)
-        loss += F.l1_loss(f_pred, f_target)
-        # Slice 3
-        f_pred   = self.slice3(f_pred)
-        f_target = self.slice3(f_target)
-        loss += F.l1_loss(f_pred, f_target)
+        # Compute target features without gradient tracking — gradients only
+        # flow through pred, so storing target activations for backward wastes memory.
+        with torch.no_grad():
+            ft1 = self.slice1(target_3)
+            ft2 = self.slice2(ft1)
+            ft3 = self.slice3(ft2)
+
+        fp1  = self.slice1(pred_3)
+        loss = F.l1_loss(fp1, ft1)
+        fp2  = self.slice2(fp1)
+        loss = loss + F.l1_loss(fp2, ft2)
+        fp3  = self.slice3(fp2)
+        loss = loss + F.l1_loss(fp3, ft3)
 
         return loss / 3.0
 

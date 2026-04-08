@@ -102,7 +102,7 @@ class ResBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         if self.use_checkpoint and self.training:
-            return checkpoint(self._forward, x, cond, use_reentrant=False)
+            return checkpoint(self._forward, x, cond, use_reentrant=True)
         return self._forward(x, cond)
 
 
