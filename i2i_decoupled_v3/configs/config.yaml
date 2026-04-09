@@ -1,6 +1,4 @@
-# =============================================================================
-# Illumination Diffusion Pipeline — Configuration (v2 fixed)
-# =============================================================================
+# config.yaml  v3 — conditioning-collapse + exposure fixes
 
 data:
   normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" 
@@ -24,36 +22,34 @@ model:
 diffusion:
   timesteps: 1000
   beta_schedule: "cosine"
-  ddim_steps: 50
+  ddim_steps: 100            # increased: 50 → 100 for better denoising quality
   ddim_eta: 0.0
-  classifier_free_guidance_scale: 5.0  # raised from 4.0 → stronger exposure shift
-  # Min-SNR-γ: downweights high-t loss, focuses training on low-t (image content)
+  classifier_free_guidance_scale: 5.0
   snr_gamma: 5.0
-  # Aux losses (exposure, perceptual, structure) only applied when t < T * this
-  aux_loss_t_frac: 0.35   # t < 350 for T=1000
+  aux_loss_t_frac: 0.45      # raised: 0.35 → 0.45 (more aux training signal)
 
 training:
   batch_size: 4
   gradient_accumulation_steps: 8
-  learning_rate: 5.0e-5    # lowered from 1e-4 for more stable convergence
+  learning_rate: 5.0e-5
   num_epochs: 300
-  warmup_steps: 1000       # increased for gentler start
+  warmup_steps: 1000
   mixed_precision: true
   grad_clip: 1.0
   lambda_diffusion: 1.0
   lambda_perceptual: 0.1
-  lambda_exposure: 0.8     # raised from 0.5 — enforce stronger exposure shift
-  lambda_structure: 0.2
+  lambda_exposure: 1.5       # raised: 0.8 → 1.5 (label-driven, stronger signal)
+  lambda_structure: 0.3
   cfg_dropout_prob: 0.15
 
 checkpoint:
-  output_dir: "../../../projects/i2i_decoupled_v3/outputs"
-  checkpoint_dir: "../../../projects/i2i_decoupled_v3/outputs/checkpoints"
-  samples_dir: "../../../projects/i2i_decoupled_v3/outputs/samples"
+  output_dir: "../../../projects/i2i_decoupled_v3_3/outputs"
+  checkpoint_dir: "../../../projects/i2i_decoupled_v3_3/outputs/checkpoints"
+  samples_dir: "../../../projects/i2i_decoupled_v3_3/outputs/samples"
   save_every_n_epochs: 1      # Save sample images every epoch
   log_every_n_steps: 50
 
 wandb:
   enabled: false
   project: "illum-diffusion"
-  run_name: "lab-ddpm-v2-snr"
+  run_name: "v3-cond-fix"
