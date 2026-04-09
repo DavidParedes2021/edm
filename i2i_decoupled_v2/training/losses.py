@@ -1,38 +1,16 @@
 """
-training/losses.py
--------------------
-All loss functions used during training.
-
-Loss taxonomy
--------------
-1. Diffusion loss  (L_diff)
-   Standard MSE on predicted vs. actual noise.  This is the core signal.
-   Improved variant: we also compute MSE in x0-space (predicted clean image)
-   for a more direct learning signal.
-
-2. Perceptual loss  (L_perc)
-   VGG-16 feature-space distance between predicted x0 and target x0.
-   Forces the model to produce perceptually sharp outputs at the feature
-   level, not just pixel level.
-   WHY THIS FIXES BLURRINESS: MSE in pixel space minimises squared error by
-   averaging; perceptual loss penalises blurring at the semantic level where
-   averaging is more visually damaging.
-
-3. Exposure loss  (L_exp)
-   Histogram-based penalty that compares the mean and std of the predicted
-   L channel against the target exposure class statistics (over/under).
-   This is the primary mechanism to enforce *strong* exposure changes.
-   We add a brightness penalty: predicted mean L must be ≥ (≤) a threshold
-   for overexposure (underexposure).
-
-4. Structure loss  (L_struct)
-   SSIM computed in the L channel between predicted x0 and the input
-   normal-L.  We want illumination to change but structure to be preserved.
-   SSIM penalises blur and contrast loss jointly.
-
-5. Adversarial / histogram alignment (optional, off by default):
-   Could add a discriminator; we use histogram matching instead since
-   training a GAN on top of DDPM is complex.
+training/losses.py  (v2 - fixed)
+----------------------------------
+Fixes vs v1:
+  1. VGG forward: each feature level now receives fresh inputs from the
+     original image, not the output of the previous layer. This is the
+     correct multi-scale perceptual loss formulation.
+  2. Exposure loss: added a much stronger mean-L penalty with a steeper
+     margin to force the model to produce clearly over/under-exposed output.
+  3. TotalLoss: auxiliary losses (perceptual, exposure, structure) are
+     gated by the SNR mask — only applied when t < T*0.35 where
+     x0_pred is actually recoverable and gradients are non-zero.
+  4. Diffusion MSE is SNR-weighted via per-sample snr_w from GaussianDiffusion.
 """
 
 import torch
@@ -43,28 +21,27 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Perceptual loss (VGG-16)
+# VGG Perceptual Loss  (FIXED: independent slices, not cascaded)
 # ---------------------------------------------------------------------------
 
 class VGGPerceptualLoss(nn.Module):
     """
-    Perceptual loss using VGG-16 features extracted at relu1_2, relu2_2,
-    relu3_3 (shallow to mid-level features capture sharpness well).
+    Multi-scale perceptual loss.
 
-    Input: single-channel [B,1,H,W] luminance images.
-           Replicated to 3 channels internally.
-
-    VGG weights are loaded lazily on first forward pass to allow the object
-    to be constructed without a network connection (useful for unit tests and
-    offline environments). On GPU machines the weights download automatically
-    from PyTorch Hub on the first call to forward().
+    FIXED: Each feature level is extracted from the ORIGINAL input by
+    running a fresh forward pass through progressively deeper sub-networks,
+    not by re-feeding the output of the previous slice. This is correct
+    multi-scale perceptual loss.
     """
 
     def __init__(self, device: torch.device):
         super().__init__()
         self._device    = device
         self._vgg_ready = False
-        self.slice1 = self.slice2 = self.slice3 = None
+        # Will be set on first call
+        self.net_to_relu1_2 = None   # depth-4  features
+        self.net_to_relu2_2 = None   # depth-9  features
+        self.net_to_relu3_3 = None   # depth-16 features
 
         self.register_buffer(
             "mean", torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
@@ -74,101 +51,91 @@ class VGGPerceptualLoss(nn.Module):
         )
 
     def _load_vgg(self):
-        """Lazy-load VGG weights on first use."""
         try:
             vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features.eval()
         except Exception:
-            # Fallback for older torchvision (< 0.13)
-            vgg = models.vgg16(pretrained=True).features.eval()  # type: ignore[attr-defined]
+            vgg = models.vgg16(pretrained=True).features.eval()  # type: ignore
         for p in vgg.parameters():
             p.requires_grad_(False)
-        # Layers: relu1_2=idx4, relu2_2=idx9, relu3_3=idx16
-        self.slice1 = nn.Sequential(*list(vgg.children())[:4]).to(self._device)
-        self.slice2 = nn.Sequential(*list(vgg.children())[4:9]).to(self._device)
-        self.slice3 = nn.Sequential(*list(vgg.children())[9:16]).to(self._device)
+        children = list(vgg.children())
+        # Three independent sub-networks, each starting from the input
+        self.net_to_relu1_2 = nn.Sequential(*children[:4]).to(self._device)
+        self.net_to_relu2_2 = nn.Sequential(*children[:9]).to(self._device)
+        self.net_to_relu3_3 = nn.Sequential(*children[:16]).to(self._device)
         self._vgg_ready = True
 
     def _prep(self, x: torch.Tensor) -> torch.Tensor:
-        """L channel [-1,1] → normalised RGB-like [B,3,H,W]."""
-        x = (x + 1.0) / 2.0               # → [0,1]
-        x = x.repeat(1, 3, 1, 1)           # → [B,3,H,W]
+        x = (x + 1.0) / 2.0           # [-1,1] → [0,1]
+        x = x.repeat(1, 3, 1, 1)      # 1-ch → 3-ch
         return (x - self.mean) / self.std
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if not self._vgg_ready:
             self._load_vgg()
 
-        pred_v   = self._prep(pred)
-        target_v = self._prep(target)
+        p = self._prep(pred)
+        t = self._prep(target.detach())   # target has no grad
 
         loss = torch.tensor(0.0, device=pred.device)
-        for sl in [self.slice1, self.slice2, self.slice3]:
-            pred_v   = sl(pred_v)
-            target_v = sl(target_v)
-            loss    += F.l1_loss(pred_v, target_v.detach())
+        # Each net runs independently from the original input
+        for net in [self.net_to_relu1_2, self.net_to_relu2_2, self.net_to_relu3_3]:
+            loss = loss + F.l1_loss(net(p), net(t))
 
         return loss
 
 
 # ---------------------------------------------------------------------------
-# Exposure loss
+# Exposure Loss  (strengthened)
 # ---------------------------------------------------------------------------
 
 class ExposureLoss(nn.Module):
     """
-    Enforces strong, class-specific illumination shift.
+    Enforces strong, class-directed exposure shift.
 
-    For each sample we compute:
-      mean_L  = mean of predicted L in [0,100] space (we have [-1,1])
-      std_L   = std of predicted L
+    Two components:
+    A) Moment matching: (mean_pred - mean_target)² + (std_pred - std_target)²
+       Differentiable histogram alignment proxy.
 
-    Over-exposed target (class=0):
-      - mean_L should be > over_mean_threshold
-      - Penalise if too dark
-
-    Under-exposed target (class=1):
-      - mean_L should be < under_mean_threshold
-      - Penalise if too bright
-
-    We also match first two moments to the target's statistics, which
-    provides a differentiable histogram-alignment proxy.
+    B) Directional hard margin:
+       over:  max(0, threshold_over  - mean_pred)²   ← penalise if too dark
+       under: max(0, mean_pred - threshold_under)²    ← penalise if too bright
+       Using SQUARED penalty (was linear before) for stronger gradient signal.
     """
 
-    OVER_THRESHOLD  =  0.35   # L normalised [-1,1]; > 0.35 → bright
-    UNDER_THRESHOLD = -0.25   # L normalised [-1,1]; < -0.25 → dark
-
-    def __init__(self):
-        super().__init__()
+    # In normalised L space ([-1, 1]), overexposed is bright (>0.3), underexposed is dark (<-0.2)
+    THRESHOLD_OVER  =  0.25   # pred mean must exceed this for overexposed
+    THRESHOLD_UNDER = -0.20   # pred mean must be below this for underexposed
+    MARGIN_WEIGHT   =  5.0    # multiplier for directional penalty (was 2.0)
 
     def forward(
         self,
-        pred:       torch.Tensor,   # [B, 1, H, W] predicted L (normalised)
-        target_L:   torch.Tensor,   # [B, 1, H, W] real target L (normalised)
-        class_labels: torch.Tensor, # [B] 0=over, 1=under
+        pred:          torch.Tensor,    # [B,1,H,W] predicted L (normalised)
+        target_L:      torch.Tensor,    # [B,1,H,W] real target L
+        class_labels:  torch.Tensor,    # [B]
     ) -> torch.Tensor:
-        B = pred.shape[0]
+        B    = pred.shape[0]
         loss = torch.tensor(0.0, device=pred.device)
 
         for b in range(B):
-            p   = pred[b]           # [1, H, W]
-            tgt = target_L[b]       # [1, H, W]
-            cl  = class_labels[b].item()
+            p   = pred[b]
+            tgt = target_L[b]
+            cl  = int(class_labels[b].item())
 
             p_mean = p.mean()
             t_mean = tgt.mean()
             p_std  = p.std()
             t_std  = tgt.std()
 
-            # Moment matching: align predicted mean + std to real target stats
-            moment_loss = (p_mean - t_mean) ** 2 + (p_std - t_std) ** 2
+            # A) Moment matching
+            moment = (p_mean - t_mean) ** 2 + (p_std - t_std) ** 2
 
-            # Directional brightness penalty
-            if cl == 0:   # overexposed: must be bright
-                dir_penalty = F.relu(self.OVER_THRESHOLD - p_mean)
-            else:         # underexposed: must be dark
-                dir_penalty = F.relu(p_mean - self.UNDER_THRESHOLD)
+            # B) Directional margin (squared for stronger gradients)
+            if cl == 0:  # overexposed → must be bright
+                margin = F.relu(self.THRESHOLD_OVER - p_mean) ** 2
+            else:        # underexposed → must be dark
+                margin = F.relu(p_mean - self.THRESHOLD_UNDER) ** 2
 
-            loss += moment_loss + 2.0 * dir_penalty
+            loss = loss + moment + self.MARGIN_WEIGHT * margin
 
         return loss / B
 
@@ -177,57 +144,56 @@ class ExposureLoss(nn.Module):
 # SSIM-based structure loss
 # ---------------------------------------------------------------------------
 
-def _ssim(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
-    """
-    Differentiable SSIM.  x,y ∈ [-1,1].
-    Returns SSIM ∈ [-1,1] (we minimise 1 - SSIM).
-    """
+def _gaussian_kernel(size: int, sigma: float, device: torch.device) -> torch.Tensor:
+    coords = torch.arange(size, dtype=torch.float32, device=device) - size // 2
+    g      = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    kernel = torch.outer(g, g)
+    return kernel / kernel.sum()
+
+
+def _ssim_map(x: torch.Tensor, y: torch.Tensor, win: int = 11, sigma: float = 1.5) -> torch.Tensor:
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
+    k  = _gaussian_kernel(win, sigma, x.device).view(1, 1, win, win).expand(x.shape[1], 1, -1, -1)
+    p  = win // 2
 
-    # Gaussian kernel
-    sigma  = 1.5
-    coords = torch.arange(window_size, dtype=torch.float32, device=x.device) - window_size // 2
-    gauss  = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-    kernel = torch.outer(gauss, gauss)
-    kernel = kernel / kernel.sum()
-    kernel = kernel.view(1, 1, window_size, window_size).expand(x.shape[1], 1, -1, -1)
+    mu_x  = F.conv2d(x, k, padding=p, groups=x.shape[1])
+    mu_y  = F.conv2d(y, k, padding=p, groups=y.shape[1])
+    mu_x2 = mu_x ** 2;  mu_y2 = mu_y ** 2;  mu_xy = mu_x * mu_y
 
-    pad = window_size // 2
-    mu_x = F.conv2d(x, kernel, padding=pad, groups=x.shape[1])
-    mu_y = F.conv2d(y, kernel, padding=pad, groups=y.shape[1])
+    sig_x2 = F.conv2d(x*x, k, padding=p, groups=x.shape[1]) - mu_x2
+    sig_y2 = F.conv2d(y*y, k, padding=p, groups=y.shape[1]) - mu_y2
+    sig_xy = F.conv2d(x*y, k, padding=p, groups=x.shape[1]) - mu_xy
 
-    mu_x2 = mu_x ** 2
-    mu_y2 = mu_y ** 2
-    mu_xy = mu_x * mu_y
-
-    sig_x2 = F.conv2d(x * x, kernel, padding=pad, groups=x.shape[1]) - mu_x2
-    sig_y2 = F.conv2d(y * y, kernel, padding=pad, groups=y.shape[1]) - mu_y2
-    sig_xy = F.conv2d(x * y, kernel, padding=pad, groups=x.shape[1]) - mu_xy
-
-    numerator   = (2 * mu_xy + C1) * (2 * sig_xy + C2)
-    denominator = (mu_x2 + mu_y2 + C1) * (sig_x2 + sig_y2 + C2)
-
-    return (numerator / (denominator + 1e-8)).mean()
+    num = (2*mu_xy + C1) * (2*sig_xy + C2)
+    den = (mu_x2 + mu_y2 + C1) * (sig_x2 + sig_y2 + C2)
+    return num / (den + 1e-8)
 
 
 class StructureLoss(nn.Module):
-    """
-    SSIM loss between predicted L and the input normal L.
-    Encourages structural preservation (edges, textures) despite exposure shift.
-    """
+    """1 − SSIM between predicted x0 and the normal-L input. Preserves anatomy."""
     def forward(self, pred_L: torch.Tensor, normal_L: torch.Tensor) -> torch.Tensor:
-        ssim_val = _ssim(pred_L, normal_L)
-        return 1.0 - ssim_val   # minimise → maximise SSIM
+        return 1.0 - _ssim_map(pred_L, normal_L).mean()
 
 
 # ---------------------------------------------------------------------------
-# Composite loss
+# Composite loss  (FIXED: SNR-gated aux losses)
 # ---------------------------------------------------------------------------
 
 class TotalLoss(nn.Module):
     """
-    Combines all losses with configurable weights.
+    Combined loss with SNR-aware gating.
+
+    Auxiliary losses (perceptual, exposure, structure) are only computed
+    for samples where the timestep t is in the low-noise regime
+    (t < T * aux_loss_t_frac, typically t < 350 for T=1000).
+
+    At high timesteps, x0_pred = (x_t - sqrt(1-alpha)*eps_pred) / sqrt(alpha)
+    has a near-zero denominator — clamping to [-1,1] produces zero gradients,
+    so these losses are useless and waste compute. Gating removes the waste.
+
+    The diffusion MSE is weighted per-sample by the Min-SNR-γ weight,
+    making the model prioritise low-t steps (where image content is visible).
     """
 
     def __init__(
@@ -235,7 +201,7 @@ class TotalLoss(nn.Module):
         device:            torch.device,
         lambda_diffusion:  float = 1.0,
         lambda_perceptual: float = 0.1,
-        lambda_exposure:   float = 0.5,
+        lambda_exposure:   float = 0.8,   # increased from 0.5
         lambda_structure:  float = 0.2,
     ):
         super().__init__()
@@ -244,36 +210,51 @@ class TotalLoss(nn.Module):
         self.w_exp   = lambda_exposure
         self.w_struc = lambda_structure
 
-        self.perc_loss   = VGGPerceptualLoss(device)
-        self.exp_loss    = ExposureLoss()
-        self.struc_loss  = StructureLoss()
+        self.perc_loss  = VGGPerceptualLoss(device)
+        self.exp_loss   = ExposureLoss()
+        self.struc_loss = StructureLoss()
 
     def forward(
         self,
-        noise_pred:    torch.Tensor,    # [B,1,H,W] predicted noise
-        noise_target:  torch.Tensor,    # [B,1,H,W] actual noise
-        x0_pred:       torch.Tensor,    # [B,1,H,W] reconstructed x0 from noise_pred
-        x0_target:     torch.Tensor,    # [B,1,H,W] clean target L (ground truth)
-        normal_L:      torch.Tensor,    # [B,1,H,W] input normal L
-        class_labels:  torch.Tensor,    # [B]
+        noise_pred:   torch.Tensor,   # [B,1,H,W]
+        noise_target: torch.Tensor,   # [B,1,H,W]
+        x0_pred:      torch.Tensor,   # [B,1,H,W]
+        x0_target:    torch.Tensor,   # [B,1,H,W]
+        normal_L:     torch.Tensor,   # [B,1,H,W]
+        class_labels: torch.Tensor,   # [B]
+        snr_w:        torch.Tensor,   # [B]   Min-SNR-γ weights
+        aux_mask:     torch.Tensor,   # [B] bool — True where t is low (aux losses valid)
     ) -> dict:
-        # 1. Diffusion MSE (noise space)
-        l_diff = F.mse_loss(noise_pred, noise_target)
+        B = noise_pred.shape[0]
 
-        # 2. Perceptual (x0 space) – fixes blurriness
-        #    Wrapped in try/except so training continues even if VGG weights
-        #    are not yet downloaded (first run, offline env, etc.)
-        try:
-            with torch.cuda.amp.autocast(enabled=False):
-                l_perc = self.perc_loss(x0_pred.float(), x0_target.float())
-        except Exception:
-            l_perc = torch.tensor(0.0, device=noise_pred.device)
+        # 1. SNR-weighted diffusion MSE
+        per_sample_mse = F.mse_loss(noise_pred, noise_target, reduction='none').mean(dim=(1,2,3))
+        l_diff = (snr_w.squeeze() * per_sample_mse).mean()
 
-        # 3. Exposure (x0 space) – fixes weak exposure changes
-        l_exp = self.exp_loss(x0_pred, x0_target, class_labels)
+        # 2–4. Auxiliary losses: only on low-t samples
+        n_aux = int(aux_mask.sum().item())
 
-        # 4. Structure (x0 vs normal L) – preserves anatomy
-        l_struc = self.struc_loss(x0_pred, normal_L)
+        if n_aux > 0:
+            x0p_low  = x0_pred[aux_mask]
+            x0t_low  = x0_target[aux_mask]
+            norm_low = normal_L[aux_mask]
+            cls_low  = class_labels[aux_mask]
+
+            # Perceptual
+            try:
+                with torch.cuda.amp.autocast(enabled=False):
+                    l_perc = self.perc_loss(x0p_low.float(), x0t_low.float())
+            except Exception:
+                l_perc = torch.tensor(0.0, device=noise_pred.device)
+
+            # Exposure
+            l_exp = self.exp_loss(x0p_low, x0t_low, cls_low)
+
+            # Structure
+            l_struc = self.struc_loss(x0p_low, norm_low)
+        else:
+            zero = torch.tensor(0.0, device=noise_pred.device)
+            l_perc = l_exp = l_struc = zero
 
         total = (
             self.w_diff  * l_diff  +
@@ -286,6 +267,7 @@ class TotalLoss(nn.Module):
             "total":      total,
             "diffusion":  l_diff.item(),
             "perceptual": l_perc.item() if hasattr(l_perc, 'item') else float(l_perc),
-            "exposure":   l_exp.item(),
-            "structure":  l_struc.item(),
+            "exposure":   l_exp.item()  if hasattr(l_exp,  'item') else float(l_exp),
+            "structure":  l_struc.item() if hasattr(l_struc,'item') else float(l_struc),
+            "n_aux_samples": n_aux,
         }
