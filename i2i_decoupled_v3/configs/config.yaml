@@ -1,0 +1,59 @@
+# =============================================================================
+# Illumination Diffusion Pipeline — Configuration (v2 fixed)
+# =============================================================================
+
+data:
+  normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" 
+  overexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
+  underexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" 
+  image_size: 256            # Training resolution (use 512 for DGX)
+  use_lab_space: true        # Apply diffusion only on L channel (LAB)
+  augment: true
+
+model:
+  in_channels: 1
+  out_channels: 1
+  base_channels: 128
+  channel_mult: [1, 2, 3, 4]
+  attention_resolutions: [16, 8]
+  num_res_blocks: 2
+  dropout: 0.1
+  num_classes: 2
+  use_fp16: true
+
+diffusion:
+  timesteps: 1000
+  beta_schedule: "cosine"
+  ddim_steps: 50
+  ddim_eta: 0.0
+  classifier_free_guidance_scale: 5.0  # raised from 4.0 → stronger exposure shift
+  # Min-SNR-γ: downweights high-t loss, focuses training on low-t (image content)
+  snr_gamma: 5.0
+  # Aux losses (exposure, perceptual, structure) only applied when t < T * this
+  aux_loss_t_frac: 0.35   # t < 350 for T=1000
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-5    # lowered from 1e-4 for more stable convergence
+  num_epochs: 300
+  warmup_steps: 1000       # increased for gentler start
+  mixed_precision: true
+  grad_clip: 1.0
+  lambda_diffusion: 1.0
+  lambda_perceptual: 0.1
+  lambda_exposure: 0.8     # raised from 0.5 — enforce stronger exposure shift
+  lambda_structure: 0.2
+  cfg_dropout_prob: 0.15
+
+checkpoint:
+  output_dir: "../../../projects/i2i_decoupled_v3/outputs"
+  checkpoint_dir: "../../../projects/i2i_decoupled_v3/outputs/checkpoints"
+  samples_dir: "../../../projects/i2i_decoupled_v3/outputs/samples"
+  save_every_n_epochs: 1      # Save sample images every epoch
+  log_every_n_steps: 50
+
+wandb:
+  enabled: false
+  project: "illum-diffusion"
+  run_name: "lab-ddpm-v2-snr"
