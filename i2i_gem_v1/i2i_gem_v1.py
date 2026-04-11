@@ -18,7 +18,7 @@ class Config:
     def __init__(self, mode="local"):
         # Paths
         self.train_norm_path = "../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" 
-        self.train_over_path = "../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
+        self.train_target_path = "../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
         self.output_dir = "../../../../projects/i2i_gem_v1/outputs"        
         # Hardware-Specific Tuning
         if mode == "dgx":
