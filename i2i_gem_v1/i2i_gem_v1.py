@@ -23,7 +23,7 @@ class Config:
         # Hardware-Specific Tuning
         if mode == "dgx":
             self.resolution = 512
-            self.batch_size = 4              # Absolute minimum to avoid OOM
+            self.batch_size = 2              # Absolute minimum to avoid OOM
             self.grad_accum_steps = 16       # Effective batch size = 16
             self.mixed_precision = "fp16"    # Standard for V100
             self.learning_rate = 1e-5        # Lower LR for Batch 1
