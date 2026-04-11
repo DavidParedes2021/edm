@@ -23,10 +23,9 @@ class Config:
         # Hardware-Specific Tuning
         if mode == "dgx":
             self.resolution = 512
-            self.batch_size = 4
-            self.mixed_precision = "fp16"
-            self.num_workers = 8
-            self.learning_rate = 2e-4
+            self.batch_size = 4        # REDUCED: 32 was too high for 16GB/512res
+            self.learning_rate = 5e-5  # Lower LR for smaller batch
+            self.mixed_precision = "fp16" # Ensure this is fp16 if your DGX is V100
         else: # Local RTX 3050 (4GB)
             self.resolution = 256
             self.batch_size = 2
@@ -78,34 +77,46 @@ class IlluminationDiffusionTrainer:
         self.cfg = cfg
         self.accelerator = Accelerator(mixed_precision=cfg.mixed_precision)
         
-        # Architecture: 2 channels in (noisy_target_L + condition_norm_L), 1 out (noise_L)
+        # FIXED ARCHITECTURE: Attention only at the lowest resolutions
         self.model = UNet2DModel(
             sample_size=cfg.resolution,
             in_channels=2, 
             out_channels=1,
             block_out_channels=(64, 128, 256, 512),
             layers_per_block=2,
-            down_block_types=("DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"),
-            up_block_types=("AttnUpBlock2D", "AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D"),
+            down_block_types=(
+                "DownBlock2D",      # 512x512 - No attention
+                "DownBlock2D",      # 256x256 - No attention
+                "DownBlock2D",      # 128x128 - No attention
+                "AttnDownBlock2D",  # 64x64   - Global attention is safe here
+            ),
+            up_block_types=(
+                "AttnUpBlock2D",    # 64x64
+                "UpBlock2D",        # 128x128
+                "UpBlock2D",        # 256x256
+                "UpBlock2D",        # 512x512
+            ),
         )
 
+        # MANDATORY MEMORY SAVING for 16GB cards
+        if hasattr(self.model, "set_attention_slice"):
+            self.model.set_attention_slice("auto")
+        
         if cfg.enable_xformers:
             try:
                 self.model.enable_xformers_memory_efficient_attention()
-            except Exception as e:
-                print(f"Xformers not available: {e}")
+            except Exception:
+                pass
 
         self.noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.learning_rate)
         
-        # Dataset & Loader
         dataset = LabEndoscopyDataset(cfg.train_norm_path, cfg.train_target_path, cfg.resolution)
         self.train_dataloader = DataLoader(
             dataset, batch_size=cfg.batch_size, shuffle=True, 
             num_workers=cfg.num_workers, pin_memory=True
         )
 
-        # Prepare for Accelerator
         self.model, self.optimizer, self.train_dataloader = self.accelerator.prepare(
             self.model, self.optimizer, self.train_dataloader
         )
