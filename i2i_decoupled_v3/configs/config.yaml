@@ -3,7 +3,7 @@
 data:
   normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" 
   overexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
-  underexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" 
+  underexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames" 
   image_size: 256            # Training resolution (use 512 for DGX)
   use_lab_space: true        # Apply diffusion only on L channel (LAB)
   augment: true

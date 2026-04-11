@@ -5,7 +5,7 @@
 data:
   normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" 
   overexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
-  underexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" 
+  underexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames" 
   image_size: 256            # Training resolution (use 512 for DGX)
   use_lab_space: true        # Apply diffusion only on L channel (LAB)
   augment: true
@@ -47,9 +47,9 @@ training:
   cfg_dropout_prob: 0.15
 
 checkpoint:
-  output_dir: "../../../projects/i2i_decoupled_v3/outputs"
-  checkpoint_dir: "../../../projects/i2i_decoupled_v3/outputs/checkpoints"
-  samples_dir: "../../../projects/i2i_decoupled_v3/outputs/samples"
+  output_dir: "../../../projects/i2i_decoupled_v4/outputs"
+  checkpoint_dir: "../../../projects/i2i_decoupled_v4/outputs/checkpoints"
+  samples_dir: "../../../projects/i2i_decoupled_v4/outputs/samples"
   save_every_n_epochs: 1      # Save sample images every epoch
   log_every_n_steps: 50
 
