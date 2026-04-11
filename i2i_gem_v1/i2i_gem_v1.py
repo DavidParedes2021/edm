@@ -77,52 +77,84 @@ class LabEndoscopyDataset(Dataset):
 class IlluminationDiffusionTrainer:
     def __init__(self, cfg):
         self.cfg = cfg
-        # Added gradient_accumulation_steps to the Accelerator
+        
+        # 1. Initialize Accelerator with Gradient Accumulation
+        # This allows us to use a small batch size (e.g., 1) while simulating a larger one.
         self.accelerator = Accelerator(
             mixed_precision=cfg.mixed_precision,
             gradient_accumulation_steps=cfg.grad_accum_steps 
         )
         
-        # ARCHITECTURE: 5 stages to reach a tiny bottleneck where attention is cheap
+        # 2. Define the UNet2DModel
+        # We use a slimmed channel count (starting at 32) to save VRAM at 512x512 resolution.
+        # Attention is ONLY used at the 32x32 resolution level to prevent OOM.
         self.model = UNet2DModel(
             sample_size=cfg.resolution,
-            in_channels=2, 
-            out_channels=1,
-            block_out_channels=(64, 128, 256, 512, 512), # 5 levels
+            in_channels=2,   # Noisy target L + Clean condition L
+            out_channels=1,  # Predicts 1-channel noise
+            block_out_channels=(32, 64, 128, 256, 512), 
             layers_per_block=2,
             down_block_types=(
-                "DownBlock2D",      # 512
-                "DownBlock2D",      # 256
-                "DownBlock2D",      # 128
-                "DownBlock2D",      # 64
-                "AttnDownBlock2D",  # 32 (Attention here is only 1024x1024 - SAFE)
+                "DownBlock2D",      # 512x512
+                "DownBlock2D",      # 256x256
+                "DownBlock2D",      # 128x128
+                "DownBlock2D",      # 64x64
+                "AttnDownBlock2D",  # 32x32 (Small enough to fit global attention)
             ),
             up_block_types=(
-                "AttnUpBlock2D",    # 32
-                "UpBlock2D",        # 64
-                "UpBlock2D",        # 128
-                "UpBlock2D",        # 256
-                "UpBlock2D",        # 512
+                "AttnUpBlock2D",    # 32x32
+                "UpBlock2D",        # 64x64
+                "UpBlock2D",        # 128x128
+                "UpBlock2D",        # 256x256
+                "UpBlock2D",        # 512x512
             ),
         )
 
-        # THE MAGIC TENSION RELIEVERS:
-        self.model.enable_gradient_checkpointing() 
+        # 3. Apply Memory Optimizations
+        # Slicing computes attention in parts; xformers uses efficient kernels if available.
         if hasattr(self.model, "set_attention_slice"):
             self.model.set_attention_slice("auto")
-
-        self.noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.learning_rate)
         
-        dataset = LabEndoscopyDataset(cfg.train_norm_path, cfg.train_target_path, cfg.resolution)
+        if cfg.enable_xformers:
+            try:
+                self.model.enable_xformers_memory_efficient_attention()
+            except Exception as e:
+                # If xformers isn't installed in the container, we fall back gracefully.
+                if self.accelerator.is_main_process:
+                    print(f"[*] xformers not available, using standard attention: {e}")
+
+        # 4. Initialize Scheduler and Optimizer
+        self.noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), 
+            lr=cfg.learning_rate
+        )
+        
+        # 5. Dataset and DataLoader
+        # Note: We keep num_workers low to save CPU memory in Docker environments.
+        dataset = LabEndoscopyDataset(
+            cfg.train_norm_path, 
+            cfg.train_target_path, 
+            cfg.resolution
+        )
+        
         self.train_dataloader = DataLoader(
-            dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers
+            dataset, 
+            batch_size=cfg.batch_size, 
+            shuffle=True, 
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            drop_last=True # Keeps batch dimensions consistent for accumulation
         )
 
+        # 6. Prepare everything for the DGX environment
+        # This handles device placement (.to(device)) and mixed precision scaling.
         self.model, self.optimizer, self.train_dataloader = self.accelerator.prepare(
             self.model, self.optimizer, self.train_dataloader
         )
-
+        
+        if self.accelerator.is_main_process:
+            print(f"[*] Trainer initialized. Model Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
     def train(self):
         # 1. Initialize Logging (Main Process Only)
