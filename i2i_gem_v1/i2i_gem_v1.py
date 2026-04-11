@@ -24,7 +24,7 @@ class Config:
         if mode == "dgx":
             self.resolution = 512
             self.batch_size = 32
-            self.mixed_precision = "bf16" # A100/H100 preference
+            self.mixed_precision = "fp16"
             self.num_workers = 8
             self.learning_rate = 2e-4
         else: # Local RTX 3050 (4GB)
