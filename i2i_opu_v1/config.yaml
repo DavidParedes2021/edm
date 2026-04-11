@@ -47,7 +47,7 @@ diffusion:
 # --- Training ---
 training:
   epochs: 300
-  batch_size: 8              # raise to 8-16 on DGX
+  batch_size: 4              # raise to 8-16 on DGX
   lr: 1.0e-4
   weight_decay: 1.0e-6
   grad_accum_steps: 1
