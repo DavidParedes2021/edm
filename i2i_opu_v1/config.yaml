@@ -23,20 +23,20 @@ image:
 model:
   in_channels: 1       # L channel only
   out_channels: 1
-  block_out_channels: [64, 128, 256, 256]
+  block_out_channels: [64, 128, 192, 256]
   layers_per_block: 2
   down_block_types:
     - "DownBlock2D"
     - "DownBlock2D"
-    - "AttnDownBlock2D"
-    - "AttnDownBlock2D"
+    - "DownBlock2D"
+    - "AttnDownBlock2D"       # attention ONLY at 16x16 (256/2^4) — 256 tokens, safe
   up_block_types:
-    - "AttnUpBlock2D"
-    - "AttnUpBlock2D"
+    - "AttnUpBlock2D"         # mirror: attention ONLY at 16x16
+    - "UpBlock2D"
     - "UpBlock2D"
     - "UpBlock2D"
   num_class_embeds: 3   # 0=overexposed, 1=underexposed, 2=unconditional(null)
-  attention_head_dim: 32
+  attention_head_dim: 16
 
 # --- Diffusion ---
 diffusion:
@@ -47,7 +47,7 @@ diffusion:
 # --- Training ---
 training:
   epochs: 300
-  batch_size: 4              # raise to 8-16 on DGX
+  batch_size: 4               # safe for 16GB; can try 8 if no OOM
   lr: 1.0e-4
   weight_decay: 1.0e-6
   grad_accum_steps: 1
