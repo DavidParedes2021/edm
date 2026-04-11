@@ -23,7 +23,7 @@ class Config:
         # Hardware-Specific Tuning
         if mode == "dgx":
             self.resolution = 512
-            self.batch_size = 32
+            self.batch_size = 16
             self.mixed_precision = "fp16"
             self.num_workers = 8
             self.learning_rate = 2e-4
