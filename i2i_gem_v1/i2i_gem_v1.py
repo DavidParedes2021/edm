@@ -23,9 +23,10 @@ class Config:
         # Hardware-Specific Tuning
         if mode == "dgx":
             self.resolution = 512
-            self.batch_size = 4        # REDUCED: 32 was too high for 16GB/512res
-            self.learning_rate = 5e-5  # Lower LR for smaller batch
-            self.mixed_precision = "fp16" # Ensure this is fp16 if your DGX is V100
+            self.batch_size = 1              # Absolute minimum to avoid OOM
+            self.grad_accum_steps = 16       # Effective batch size = 16
+            self.mixed_precision = "fp16"    # Standard for V100
+            self.learning_rate = 1e-5        # Lower LR for Batch 1
             self.num_workers = 8
         else: # Local RTX 3050 (4GB)
             self.resolution = 256
@@ -76,105 +77,155 @@ class LabEndoscopyDataset(Dataset):
 class IlluminationDiffusionTrainer:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.accelerator = Accelerator(mixed_precision=cfg.mixed_precision)
+        # Added gradient_accumulation_steps to the Accelerator
+        self.accelerator = Accelerator(
+            mixed_precision=cfg.mixed_precision,
+            gradient_accumulation_steps=cfg.grad_accum_steps 
+        )
         
-        # FIXED ARCHITECTURE: Attention only at the lowest resolutions
+        # ARCHITECTURE: 5 stages to reach a tiny bottleneck where attention is cheap
         self.model = UNet2DModel(
             sample_size=cfg.resolution,
             in_channels=2, 
             out_channels=1,
-            block_out_channels=(64, 128, 256, 512),
+            block_out_channels=(64, 128, 256, 512, 512), # 5 levels
             layers_per_block=2,
             down_block_types=(
-                "DownBlock2D",      # 512x512 - No attention
-                "DownBlock2D",      # 256x256 - No attention
-                "DownBlock2D",      # 128x128 - No attention
-                "AttnDownBlock2D",  # 64x64   - Global attention is safe here
+                "DownBlock2D",      # 512
+                "DownBlock2D",      # 256
+                "DownBlock2D",      # 128
+                "DownBlock2D",      # 64
+                "AttnDownBlock2D",  # 32 (Attention here is only 1024x1024 - SAFE)
             ),
             up_block_types=(
-                "AttnUpBlock2D",    # 64x64
-                "UpBlock2D",        # 128x128
-                "UpBlock2D",        # 256x256
-                "UpBlock2D",        # 512x512
+                "AttnUpBlock2D",    # 32
+                "UpBlock2D",        # 64
+                "UpBlock2D",        # 128
+                "UpBlock2D",        # 256
+                "UpBlock2D",        # 512
             ),
         )
 
-        # MANDATORY MEMORY SAVING for 16GB cards
+        # THE MAGIC TENSION RELIEVERS:
+        self.model.enable_gradient_checkpointing() 
         if hasattr(self.model, "set_attention_slice"):
             self.model.set_attention_slice("auto")
-        
-        if cfg.enable_xformers:
-            try:
-                self.model.enable_xformers_memory_efficient_attention()
-            except Exception:
-                pass
 
         self.noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.learning_rate)
         
         dataset = LabEndoscopyDataset(cfg.train_norm_path, cfg.train_target_path, cfg.resolution)
         self.train_dataloader = DataLoader(
-            dataset, batch_size=cfg.batch_size, shuffle=True, 
-            num_workers=cfg.num_workers, pin_memory=True
+            dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers
         )
 
         self.model, self.optimizer, self.train_dataloader = self.accelerator.prepare(
             self.model, self.optimizer, self.train_dataloader
         )
 
+
     def train(self):
+        # 1. Initialize Logging (Main Process Only)
         if self.cfg.use_wandb and self.accelerator.is_main_process:
-            wandb.init(project="Endo-I2I-Diffusion-Luminance")
+            wandb.init(
+                project="Endo-Luminance-DGX",
+                config={
+                    "resolution": self.cfg.resolution,
+                    "batch_size": self.cfg.batch_size,
+                    "grad_accum_steps": self.cfg.grad_accum_steps,
+                    "learning_rate": self.cfg.learning_rate,
+                    "precision": self.cfg.mixed_precision
+                }
+            )
 
         best_loss = float('inf')
+        global_step = 0
+
+        print(f"[*] Starting Training. Total Epochs: {self.cfg.num_epochs}")
         
         for epoch in range(self.cfg.num_epochs):
             self.model.train()
-            progress_bar = tqdm(total=len(self.train_dataloader), disable=not self.accelerator.is_local_main_process)
-            progress_bar.set_description(f"Epoch {epoch}")
+            epoch_loss = 0.0
+            
+            # Progress bar for the main process
+            progress_bar = tqdm(
+                total=len(self.train_dataloader), 
+                disable=not self.accelerator.is_local_main_process,
+                desc=f"Epoch {epoch}"
+            )
 
-            epoch_loss = 0
-            for batch in self.train_dataloader:
-                clean_l = batch["target_l"]
-                cond_l = batch["norm_l"]
+            for step, batch in enumerate(self.train_dataloader):
+                # 2. Gradient Accumulation Context Manager
+                with self.accelerator.accumulate(self.model):
+                    # Data Preparation
+                    clean_l = batch["target_l"] # The L-channel we want to learn (Over/Under)
+                    cond_l = batch["norm_l"]    # The Normal L-channel as condition
+                    
+                    # Diffusion Math
+                    noise = torch.randn_like(clean_l)
+                    bs = clean_l.shape[0]
+                    timesteps = torch.randint(
+                        0, self.noise_scheduler.config.num_train_timesteps, 
+                        (bs,), device=self.accelerator.device
+                    ).long()
+
+                    # Add noise to target L
+                    noisy_l = self.noise_scheduler.add_noise(clean_l, noise, timesteps)
+                    
+                    # Concatenate noisy target + clean condition
+                    # Shape: [B, 2, H, W]
+                    model_input = torch.cat([noisy_l, cond_l], dim=1)
+                    
+                    # 3. Forward Pass
+                    noise_pred = self.model(model_input, timesteps).sample
+                    
+                    # 4. Loss & Backward
+                    loss = F.mse_loss(noise_pred, noise)
+                    self.accelerator.backward(loss)
+                    
+                    # Optimizer Step (only happens every 'grad_accum_steps' steps)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+                # Update Progress
+                if self.accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    global_step += 1
                 
-                # Sample noise and timesteps
-                noise = torch.randn_like(clean_l)
-                timesteps = torch.randint(0, 1000, (clean_l.shape[0],), device=self.accelerator.device).long()
-                
-                # Add noise to target luminance (L)
-                noisy_l = self.noise_scheduler.add_noise(clean_l, noise, timesteps)
-                
-                # Concatenate condition (Normal L) to noisy target
-                model_input = torch.cat([noisy_l, cond_l], dim=1)
-                
-                # Predict noise
-                prediction = self.model(model_input, timesteps).sample
-                
-                # Loss calculation
-                loss = F.mse_loss(prediction, noise)
-                
-                self.accelerator.backward(loss)
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                
-                progress_bar.update(1)
                 epoch_loss += loss.detach().item()
 
-            avg_loss = epoch_loss / len(self.train_dataloader)
+            # --- End of Epoch Logic ---
+            avg_epoch_loss = epoch_loss / len(self.train_dataloader)
+            
             if self.accelerator.is_main_process:
-                print(f"[*] Epoch {epoch} Avg Loss: {avg_loss:.6f}")
+                print(f"[*] Epoch {epoch} Average Loss: {avg_epoch_loss:.6f}")
+                
                 if self.cfg.use_wandb:
-                    wandb.log({"loss": avg_loss, "epoch": epoch})
+                    wandb.log({"epoch_loss": avg_epoch_loss, "epoch": epoch}, step=global_step)
+
+                # 5. Checkpointing (Save Best and Latest)
+                # Unwrapping the model is necessary for saving when using Accelerator
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
                 
-                # Save Best Model
-                if avg_loss < best_loss:
-                    best_loss = avg_loss
-                    self.accelerator.save(self.model.state_dict(), os.path.join(self.cfg.output_dir, "best_model.pt"))
-                
-                # Periodically generate samples
+                # Latest
+                latest_path = os.path.join(self.cfg.output_dir, "latest_model.pt")
+                torch.save(unwrapped_model.state_dict(), latest_path)
+
+                # Best
+                if avg_epoch_loss < best_loss:
+                    best_loss = avg_epoch_loss
+                    best_path = os.path.join(self.cfg.output_dir, "best_model.pt")
+                    torch.save(unwrapped_model.state_dict(), best_path)
+                    print(f"    --> New Best Loss! Model saved to {best_path}")
+
+                # 6. Periodic Visual Sampling
                 if epoch % self.cfg.save_image_epochs == 0:
-                    self.save_samples(batch, epoch)
+                    print(f"[*] Generating Visual Sample for Epoch {epoch}...")
+                    # We pass the same batch to see progress on the same images
+                    self.save_samples(batch, epoch, global_step)
+
+        if self.accelerator.is_main_process and self.cfg.use_wandb:
+            wandb.finish()
 
     @torch.no_grad()
     def save_samples(self, batch, epoch):
