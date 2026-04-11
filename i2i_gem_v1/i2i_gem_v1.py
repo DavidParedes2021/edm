@@ -26,6 +26,7 @@ class Config:
             self.batch_size = 4        # REDUCED: 32 was too high for 16GB/512res
             self.learning_rate = 5e-5  # Lower LR for smaller batch
             self.mixed_precision = "fp16" # Ensure this is fp16 if your DGX is V100
+            self.num_workers = 8
         else: # Local RTX 3050 (4GB)
             self.resolution = 256
             self.batch_size = 2
