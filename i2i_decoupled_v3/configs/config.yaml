@@ -43,9 +43,9 @@ training:
   cfg_dropout_prob: 0.15
 
 checkpoint:
-  output_dir: "../../../projects/i2i_decoupled_v3_3/outputs"
-  checkpoint_dir: "../../../projects/i2i_decoupled_v3_3/outputs/checkpoints"
-  samples_dir: "../../../projects/i2i_decoupled_v3_3/outputs/samples"
+  output_dir: "../../../projects/i2i_decoupled_v3_3/t2/outputs"
+  checkpoint_dir: "../../../projects/i2i_decoupled_v3_3/t2/outputs/checkpoints"
+  samples_dir: "../../../projects/i2i_decoupled_v3_3/t2/outputs/samples"
   save_every_n_epochs: 1      # Save sample images every epoch
   log_every_n_steps: 50
 
