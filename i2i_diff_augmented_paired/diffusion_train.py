@@ -97,8 +97,10 @@ def build_model(cfg: dict, device: torch.device) -> UNet2DModel:
         attention_head_dim=cfg["model"]["attention_head_dim"],
     )
     model = model.to(device)
-    if hasattr(model, "enable_gradient_checkpointing"):
+    try:
         model.enable_gradient_checkpointing()
+    except (ValueError, AttributeError):
+        print("[Model] gradient checkpointing not supported — skipping")
     return model
 
 
