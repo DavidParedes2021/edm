@@ -51,10 +51,10 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 def _load_midas(model_type: str, device: torch.device):
     """Load a MiDaS model via torch.hub. Returns (model, transform_fn)."""
     print(f"[depth] loading MiDaS ({model_type}) via torch.hub …")
-    model = torch.hub.load("intel-isl/MiDaS", model_type, trust_repo=True)
+    model = torch.hub.load("intel-isl/MiDaS", model_type)
     model = model.to(device).eval()
 
-    transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+    transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
     if model_type in ("DPT_Large", "DPT_Hybrid"):
         transform = transforms.dpt_transform
     else:
