@@ -188,8 +188,8 @@ class NormalInferenceDataset(Dataset):
         self,
         normal_dir: str,
         image_size: int = 256,
-        depth_dir: str = None,        # if None, depth is computed on-the-fly
-        depth_model_id: str = "depth-anything/Depth-Anything-V2-Small-hf",
+        depth_dir: str = None,                 # if None, depth is computed on-the-fly
+        depth_backend: str = "midas",          # 'midas' | 'midas_hybrid' | 'depth_anything_v2_hf'
     ):
         self.image_size = image_size
         folder = Path(normal_dir)
@@ -199,18 +199,50 @@ class NormalInferenceDataset(Dataset):
         print(f"[InferenceDataset] {len(self.paths)} images from {normal_dir}")
 
         self.depth_dir = Path(depth_dir) if depth_dir else None
-        self._depth_pipe = None
-        self._depth_model_id = depth_model_id
+        self._depth_backend = depth_backend
+        self._depth_model = None       # lazy — may be pipe (HF) or (model, transform) tuple (MiDaS)
 
-    def _ensure_depth_pipe(self):
-        if self._depth_pipe is None:
+    def _ensure_depth_model(self):
+        """Lazy-init the on-the-fly depth model. Prefers cached .npy on disk;
+        this only fires when depth_dir is missing a file."""
+        if self._depth_model is not None:
+            return
+
+        import torch as _t
+        dev = _t.device("cuda" if _t.cuda.is_available() else "cpu")
+        backend = self._depth_backend
+
+        if backend in ("midas", "midas_hybrid"):
+            mtype = "DPT_Large" if backend == "midas" else "DPT_Hybrid"
+            print(f"[InferenceDataset] lazy-loading MiDaS {mtype} via torch.hub")
+            m = _t.hub.load("intel-isl/MiDaS", mtype, trust_repo=True).to(dev).eval()
+            tfs = _t.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+            tf = tfs.dpt_transform if mtype in ("DPT_Large", "DPT_Hybrid") else tfs.small_transform
+            self._depth_model = ("midas", m, tf, dev)
+
+        elif backend == "depth_anything_v2_hf":
+            # Guard against stale transformers (DA V2 support lands in 4.42)
+            import transformers
+            try:
+                parts = [int(p) for p in transformers.__version__.split(".")[:2]]
+                if (parts[0], parts[1]) < (4, 42):
+                    raise RuntimeError(
+                        f"transformers {transformers.__version__} is too old for "
+                        f"Depth Anything V2 (need >= 4.42). "
+                        f"Either upgrade or switch depth_backend to 'midas'."
+                    )
+            except (ValueError, IndexError):
+                pass
             from transformers import pipeline
-            import torch as _t
-            dev = 0 if _t.cuda.is_available() else -1
-            print(f"[InferenceDataset] lazy-loading {self._depth_model_id}")
-            self._depth_pipe = pipeline(
-                task="depth-estimation", model=self._depth_model_id, device=dev
+            print("[InferenceDataset] lazy-loading DA V2 Small via HF pipeline")
+            pipe = pipeline(
+                task="depth-estimation",
+                model="depth-anything/Depth-Anything-V2-Small-hf",
+                device=0 if dev.type == "cuda" else -1,
             )
+            self._depth_model = ("hf", pipe, None, dev)
+        else:
+            raise ValueError(f"unknown depth_backend: {backend}")
 
     def _load_or_compute_depth(self, path: Path, img_pil: Image.Image) -> np.ndarray:
         # 1. try disk cache
@@ -219,18 +251,35 @@ class NormalInferenceDataset(Dataset):
             if candidate.exists():
                 d = np.load(str(candidate)).astype(np.float32)
                 return np.clip(d, 0.0, 1.0)
+
         # 2. compute inline
-        self._ensure_depth_pipe()
-        out = self._depth_pipe(img_pil)
+        self._ensure_depth_model()
+        kind, model_or_pipe, transform, dev = self._depth_model
         import torch as _t
-        dt = out["predicted_depth"]
-        if dt.ndim == 2:
-            dt = dt.unsqueeze(0).unsqueeze(0)
-        elif dt.ndim == 3:
-            dt = dt.unsqueeze(0)
-        W, H = img_pil.size
-        dt = _t.nn.functional.interpolate(dt, size=(H, W), mode="bicubic", align_corners=False)
-        d = dt.squeeze().cpu().numpy().astype(np.float32)
+
+        if kind == "midas":
+            img_np = np.array(img_pil.convert("RGB"))
+            H, W = img_np.shape[:2]
+            with _t.no_grad():
+                batch = transform(img_np).to(dev)
+                pred = model_or_pipe(batch)
+                pred = _t.nn.functional.interpolate(
+                    pred.unsqueeze(1), size=(H, W), mode="bicubic", align_corners=False
+                ).squeeze()
+            d = pred.detach().cpu().numpy().astype(np.float32)
+        else:  # kind == "hf"
+            out = model_or_pipe(img_pil)
+            dt = out["predicted_depth"]
+            if dt.ndim == 2:
+                dt = dt.unsqueeze(0).unsqueeze(0)
+            elif dt.ndim == 3:
+                dt = dt.unsqueeze(0)
+            W, H = img_pil.size
+            dt = _t.nn.functional.interpolate(
+                dt, size=(H, W), mode="bicubic", align_corners=False
+            )
+            d = dt.squeeze().detach().cpu().numpy().astype(np.float32)
+
         mn, mx = float(d.min()), float(d.max())
         if mx - mn < 1e-6:
             return np.full_like(d, 0.5, dtype=np.float32)

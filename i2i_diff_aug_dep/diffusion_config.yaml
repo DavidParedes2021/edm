@@ -18,9 +18,13 @@
 #     deterministic, non-learned correction keyed on (L_new, depth).
 #
 # One-time setup before training:
+#   # Default: MiDaS via torch.hub (no transformers version requirement)
 #   python depth_estimator.py \
 #       --input_dir  ../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames \
 #       --output_dir ../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/depth
+#
+#   # Alternative: Depth Anything V2 (requires transformers >= 4.42)
+#   python depth_estimator.py --backend depth_anything_v2_hf --input_dir ... --output_dir ...
 #
 #   python generate_pairs.py \
 #       --normal_dir ../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames \
