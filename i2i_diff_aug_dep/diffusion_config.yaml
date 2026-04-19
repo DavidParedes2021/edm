@@ -1,0 +1,148 @@
+# ============================================================
+# Depth-Aware Paired Luminance Diffusion — Config
+# ============================================================
+# Conditional DDPM on L channel, with depth conditioning.
+#   input  = concat(noisy_target_L, source_L, depth) → 3 channels
+#   output = predicted noise on target_L              → 1 channel
+#   class  = {0: overexposed, 1: underexposed}
+#
+# Key differences vs. the original pipeline:
+#   - UNet in_channels: 2 → 3 (depth is concatenated as a 3rd channel).
+#   - Optional FiLM conditioning on depth statistics (zero-initialised
+#     so training starts identical to the no-FiLM baseline).
+#   - New losses: DarknessWeightedL1Loss + DepthGradientConsistencyLoss.
+#     VGG perceptual loss removed (pulls toward smoothness, fights true
+#     darkness — it was a net regression for the underexposure objective).
+#   - A post-hoc chroma attenuation step is applied during sample
+#     generation and inference (see chroma_attenuation.py). It is a
+#     deterministic, non-learned correction keyed on (L_new, depth).
+#
+# One-time setup before training:
+#   python depth_estimator.py \
+#       --input_dir  ../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames \
+#       --output_dir ../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/depth
+#
+#   python generate_pairs.py \
+#       --normal_dir ../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames \
+#       --depth_dir  ../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/depth \
+#       --output_dir ../../../../projects/i2i_aug_diff_v1/t1/outputs/pairs \
+#       --strength 0.85 --shift_magnitude 50.0
+
+# --- Data paths ---
+data:
+  pairs_dir:  "../../../../projects/i2i_aug_diff_v1/t1/outputs/pairs"
+  normal_dir: "../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
+  depth_dir:  "../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/depth"
+
+# --- Output paths ---
+output:
+  root: "../../../../projects/i2i_aug_diff_v1/t1/outputs"
+  checkpoints_dir: "../../../../projects/i2i_aug_diff_v1/t1/outputs/checkpoints"
+  samples_dir:     "../../../../projects/i2i_aug_diff_v1/t1/outputs/samples"
+
+# --- Image settings ---
+image:
+  size: 256
+
+# --- Model ---
+# 3 input channels: noisy target L + clean source L + depth
+model:
+  in_channels: 3
+  out_channels: 1
+  block_out_channels: [64, 128, 192, 256]
+  layers_per_block: 2
+  down_block_types:
+    - "DownBlock2D"
+    - "DownBlock2D"
+    - "DownBlock2D"
+    - "AttnDownBlock2D"
+  up_block_types:
+    - "AttnUpBlock2D"
+    - "UpBlock2D"
+    - "UpBlock2D"
+    - "UpBlock2D"
+  num_class_embeds: 2            # 0=overexposed, 1=underexposed
+  attention_head_dim: 16
+
+  # FiLM modulation on 4-D depth stats [mean, std, p10, p90] → time-embed.
+  # Last layer is zero-initialised so training starts identical to
+  # the no-FiLM baseline. Toggle on after a first successful run if
+  # depth-stats variation across frames is low.
+  depth_film: false
+  depth_film_hidden: 64
+
+# --- Diffusion ---
+diffusion:
+  num_train_timesteps: 1000
+  beta_schedule: "squaredcos_cap_v2"
+  prediction_type: "epsilon"
+
+# --- Training ---
+training:
+  epochs: 300
+  batch_size: 4
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  grad_accum_steps: 1
+  mixed_precision: true
+  ema_decay: 0.9999
+  num_workers: 4
+  save_every_n_epochs: 10
+  patience: 50
+
+  # Robustness augmentations (applied in the dataset, jointly to
+  # source_L / target_L / depth where appropriate).
+  gamma_jitter: 0.1         # ± multiplicative gamma on L channels
+  depth_noise_sigma: 0.02   # Gaussian noise added to depth in [0,1] space
+
+# --- Losses ---
+# All weights apply to the x0-estimate (predicted clean target L).
+# Set any weight to 0 to disable the term.
+losses:
+  mse_weight: 1.0
+  l1_weight: 0.1            # plain L1 on x0 vs target
+  edge_weight: 0.03         # Sobel edge map L1 (sharpness)
+
+  # NEW: darkness-weighted L1 — upweights pixels where target L is low.
+  # w(y) = 1 + dark_alpha * exp(-(y + 1) / dark_tau)
+  # with y = target_L in [-1, 1]. dark_alpha controls peak weight at
+  # y = -1 (pure black); dark_tau controls how quickly the emphasis
+  # decays as y rises. Fixes "weak underexposure" without driving the
+  # overexposed branch off-target.
+  dark_weight: 0.15
+  dark_alpha:  3.0
+  dark_tau:    0.3
+
+  # NEW: depth-gradient consistency — one-sided hinge that penalises
+  # exposure-shift gradients in regions where the depth is locally flat.
+  # ReLU( |∇D|_n - |∇(L_pred - L_src)|_n - margin ).mean()
+  # (both gradients 98th-percentile normalised per image). This is what
+  # kills the "unnatural shapes" failure mode by forcing exposure
+  # falloff to track geometry rather than luminance clusters.
+  depth_grad_weight: 0.05
+  dgrad_margin:      0.1
+
+# --- Chroma attenuation (post-hoc, non-learned) ---
+# Applied after texture reinjection, before LAB → RGB, in both the
+# training-time sample generation and the full inference script.
+# See chroma_attenuation.py for the full formulas.
+chroma:
+  sat_knee:           5.0    # L at which the chroma multiplier hits sat_floor
+  sat_full:          40.0    # L at which the chroma multiplier reaches 1.0
+  sat_floor:          0.10   # minimum chroma multiplier (never exactly 0)
+  depth_chroma_boost: 0.30   # extra desat for far regions
+  highlight_desat:    0.60   # chroma cut for overexposed clipping
+  highlight_knee:    90.0    # L above which highlight_desat kicks in
+  purkinje_b_shift:   1.5    # max negative B shift in very dark pixels
+  purkinje_threshold: 20.0   # below this L, the Purkinje shift ramps up
+
+# --- Inference ---
+inference:
+  num_inference_steps: 50
+  batch_size: 1
+
+# --- Logging ---
+logging:
+  use_wandb: false
+  wandb_project: "depth-aware-exposure-diffusion"
+  wandb_entity: null
