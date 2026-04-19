@@ -215,8 +215,8 @@ class NormalInferenceDataset(Dataset):
         if backend in ("midas", "midas_hybrid"):
             mtype = "DPT_Large" if backend == "midas" else "DPT_Hybrid"
             print(f"[InferenceDataset] lazy-loading MiDaS {mtype} via torch.hub")
-            m = _t.hub.load("intel-isl/MiDaS", mtype, trust_repo=True).to(dev).eval()
-            tfs = _t.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+            m = _t.hub.load("intel-isl/MiDaS", mtype).to(dev).eval()
+            tfs = _t.hub.load("intel-isl/MiDaS", "transforms")
             tf = tfs.dpt_transform if mtype in ("DPT_Large", "DPT_Hybrid") else tfs.small_transform
             self._depth_model = ("midas", m, tf, dev)
 
