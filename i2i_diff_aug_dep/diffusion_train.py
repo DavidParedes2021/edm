@@ -382,6 +382,21 @@ def train(cfg: dict, resume_path: str = None):
     l1_w   = cfg["losses"]["l1_weight"]
     dark_w = cfg["losses"].get("dark_weight", 0.15)
     dg_w   = cfg["losses"].get("depth_grad_weight", 0.05)
+    # SNR gating: auxiliary x0-losses are only meaningful when the x0 estimate
+    # has a reasonable signal-to-noise ratio. At high timesteps, x0_hat is
+    # dominated by the 1/sqrt(alpha_bar) amplification of pred_noise error
+    # and becomes numerically unstable. Default: aux losses fire only on the
+    # lower half of the timestep range.
+    aux_max_t = int(cfg["losses"].get(
+        "aux_max_t_frac", 0.5
+    ) * cfg["diffusion"]["num_train_timesteps"])
+
+    # Pre-cached cumulative-alpha tensor (fp32, on device) for the x0 math
+    alphas_cumprod_fp32 = noise_scheduler.alphas_cumprod.to(
+        device=device, dtype=torch.float32
+    )
+
+    nan_skips = 0  # running count of steps skipped due to non-finite loss
 
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -408,40 +423,89 @@ def train(cfg: dict, resume_path: str = None):
 
             with autocast(enabled=cfg["training"]["mixed_precision"]):
                 pred_noise = model(model_input, timesteps, class_labels=labels).sample
-
                 loss_mse = F.mse_loss(pred_noise, noise)
                 total = mse_w * loss_mse
 
-                # x0-estimate for the pixel-level losses
-                alpha_prod = noise_scheduler.alphas_cumprod.to(device)[timesteps]
-                alpha_prod = alpha_prod.view(-1, 1, 1, 1)
-                sqrt_a = torch.sqrt(alpha_prod).clamp(min=1e-8)
-                sqrt_1ma = torch.sqrt(1.0 - alpha_prod)
-                x0_hat = (noisy_target - sqrt_1ma * pred_noise) / sqrt_a
+            # ── x0-estimate path (fp32, OUTSIDE autocast) ──────────────────
+            # This is the previous NaN source: at high t, alpha_cumprod -> 0,
+            # so 1/sqrt(alpha_cumprod) amplifies pred_noise error to fp16-
+            # overflow magnitudes. Fix: do the division in fp32, then clamp
+            # x0_hat into the valid normalised-L range [-1, 1] before any
+            # auxiliary loss sees it, AND gate aux losses off at high t.
+            aux_mask = (timesteps <= aux_max_t)           # (B,) bool
+            n_aux = int(aux_mask.sum().item())
 
-                parts_this_step = {"mse": float(loss_mse.detach())}
+            parts_this_step = {"mse": float(loss_mse.detach())}
+
+            if n_aux > 0 and (l1_w + edge_w + dark_w + dg_w) > 0:
+                pred_noise_f = pred_noise.float()
+                noisy_target_f = noisy_target.float()
+                target_L_f = target_L.float()
+                source_L_f = source_L.float()
+                depth_f = depth.float()
+
+                a_bar = alphas_cumprod_fp32[timesteps].view(-1, 1, 1, 1)
+                # Floor alpha_bar so sqrt is well above fp16 precision floor.
+                a_bar = a_bar.clamp_min(1e-4)
+                sqrt_a   = torch.sqrt(a_bar)
+                sqrt_1ma = torch.sqrt((1.0 - a_bar).clamp_min(0.0))
+                x0_hat = (noisy_target_f - sqrt_1ma * pred_noise_f) / sqrt_a
+                # The critical clamp — aux losses only operate on values the
+                # *target* could plausibly take.
+                x0_hat = x0_hat.clamp(-1.5, 1.5)
+
+                # Select only the subset of the batch that passes the SNR gate
+                sel = aux_mask
+                x0_s   = x0_hat[sel]
+                tgt_s  = target_L_f[sel]
+                src_s  = source_L_f[sel]
+                dep_s  = depth_f[sel]
+
+                aux_total = 0.0
 
                 if l1_w > 0:
-                    l_l1 = F.l1_loss(x0_hat, target_L)
-                    total = total + l1_w * l_l1
+                    l_l1 = F.l1_loss(x0_s, tgt_s)
+                    aux_total = aux_total + l1_w * l_l1
                     parts_this_step["l1"] = float(l_l1.detach())
 
                 if edge_w > 0:
-                    l_edge = edge_loss_fn(x0_hat, target_L)
-                    total = total + edge_w * l_edge
+                    l_edge = edge_loss_fn(x0_s, tgt_s)
+                    aux_total = aux_total + edge_w * l_edge
                     parts_this_step["edge"] = float(l_edge.detach())
 
                 if dark_w > 0:
-                    l_dark = dark_loss_fn(x0_hat, target_L)
-                    total = total + dark_w * l_dark
+                    l_dark = dark_loss_fn(x0_s, tgt_s)
+                    aux_total = aux_total + dark_w * l_dark
                     parts_this_step["dark"] = float(l_dark.detach())
 
                 if dg_w > 0:
-                    l_dg = dgrad_loss_fn(x0_hat, source_L, depth)
-                    total = total + dg_w * l_dg
+                    l_dg = dgrad_loss_fn(x0_s, src_s, dep_s)
+                    aux_total = aux_total + dg_w * l_dg
                     parts_this_step["dg"] = float(l_dg.detach())
 
-                loss = total / grad_accum
+                # Scale aux by fraction of batch that passed the gate so its
+                # contribution is stable as the SNR-gate selectivity varies.
+                total = total + aux_total * (n_aux / B)
+
+            loss = total / grad_accum
+
+            # ── NaN guard ─────────────────────────────────────────────────
+            # If any per-part value is non-finite, drop this microbatch
+            # rather than contaminating the gradients.
+            loss_val = float(loss.detach())
+            parts_finite = all(
+                (v != v) is False and v not in (float("inf"), float("-inf"))
+                for v in parts_this_step.values()
+            )
+            if (loss_val != loss_val) or loss_val in (float("inf"), float("-inf")) \
+                    or not parts_finite:
+                nan_skips += 1
+                optimiser.zero_grad(set_to_none=True)
+                if nan_skips <= 10 or nan_skips % 50 == 0:
+                    print(f"[WARN] non-finite loss at epoch {epoch+1} "
+                          f"step {step} (total skips: {nan_skips}); "
+                          f"parts={parts_this_step}")
+                continue
 
             scaler.scale(loss).backward()
             if (step + 1) % grad_accum == 0:
@@ -461,7 +525,8 @@ def train(cfg: dict, resume_path: str = None):
         avg = epoch_loss / max(n_batches, 1)
         avg_parts = {k: v / max(n_batches, 1) for k, v in epoch_parts.items()}
         print(f"[Epoch {epoch+1}] avg={avg:.5f}  | "
-              + " ".join(f"{k}={v:.4f}" for k, v in avg_parts.items()))
+              + " ".join(f"{k}={v:.4f}" for k, v in avg_parts.items())
+              + f"  | nan_skips(cumul)={nan_skips}")
 
         if use_wandb:
             import wandb
