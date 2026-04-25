@@ -1,0 +1,62 @@
+# =============================================================================
+# Diffusion-based Image-to-Image illumination-artifact pipeline.
+# A single config drives BOTH the overexposure and underexposure specialist.
+# Switch the artifact via:   --artifact overexposure   or   --artifact underexposure
+# =============================================================================
+
+data:
+  normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
+  overexposed_dir:  "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"
+  underexposed_dir:  "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"
+  image_size: 256
+  num_workers: 2
+
+model:
+  artifact: overexposure          # one of: overexposure | underexposure
+  in_channels: 4                  # [noisy_L, known_L, mask, depth_proxy]
+  out_channels: 1                 # epsilon (noise) for the L channel only
+  base_channels: 64
+  channel_mults: [1, 2, 2, 4, 4]  # 5 resolutions: 256/128/64/32/16
+  num_attn_blocks_from_bottom: 2  # AttnBlock at the two deepest resolutions
+
+train:
+  device: cuda
+  batch_size: 8
+  num_steps: 30000
+  lr: 1.0e-4
+  ema_decay: 0.999
+  amp: true
+  grad_clip: 1.0
+  num_train_timesteps: 1000
+  beta_schedule: linear
+  prediction_type: epsilon
+  mask_loss_weight_inside: 6.0    # heavily push gradients into the focal cluster
+  mask_loss_weight_outside: 1.0
+  mask_dropout_prob: 0.10         # CFG: train 10% of steps with empty mask
+  log_every: 50
+  sample_every: 1000
+  save_every: 1000
+  seed: 42
+
+sample:
+  num_inference_steps: 50
+  cfg_scale: 3.5                  # > 1 amplifies the conditional inpainting effect
+  num_samples: 8
+  resample_known_at_each_step: true   # RePaint-style boundary consistency
+  hard_substitute_outside: true       # exact preservation outside the mask
+
+mask:
+  cluster_fraction: 0.18          # focal cluster covers ~18% of valid pixels
+  dilation_iters: 4
+  blur_sigma: 6.0
+  min_component_area_frac: 0.005
+
+paths:
+  output_dir: "../../../projects/i2i_diff_aug_dep_V2/outputs"
+  ckpt_dir: "../../../projects/i2i_diff_aug_dep_V2/outputs/checkpoints"
+  samples_dir: "../../../projects/i2i_diff_aug_dep_V2/outputs/samples"
+
+wandb:
+  enabled: false
+  project: endoscopy-illumination-diffusion
+  run_name: null
