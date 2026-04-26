@@ -33,6 +33,36 @@ def _autocast_ctx(enabled: bool):
         return torch.cuda.amp.autocast(enabled=enabled)                 # torch <= 1.x
 
 
+def _patch_gradient_checkpointing(unet) -> None:
+    """Wrap each down/up/mid block forward with torch.utils.checkpoint so the
+    activations of large blocks are recomputed in backward instead of stored.
+
+    diffusers 0.14 UNet2DModel does not implement enable_gradient_checkpointing(),
+    so we monkey-patch. Block forwards return tuples; the wrapper preserves them.
+    """
+    import torch.utils.checkpoint as _ckpt
+
+    def _wrap(module):
+        original_forward = module.forward
+
+        def fwd(*args, **kwargs):
+            def run(*inner):
+                return original_forward(*inner, **kwargs)
+            try:
+                return _ckpt.checkpoint(run, *args, use_reentrant=False)
+            except TypeError:
+                return _ckpt.checkpoint(run, *args)
+
+        module.forward = fwd
+
+    for blk in list(getattr(unet, "down_blocks", [])):
+        _wrap(blk)
+    if getattr(unet, "mid_block", None) is not None:
+        _wrap(unet.mid_block)
+    for blk in list(getattr(unet, "up_blocks", [])):
+        _wrap(blk)
+
+
 def _resolve_data_dir(cfg: dict) -> str:
     artifact = cfg["model"]["artifact"]
     if artifact == "overexposure":
@@ -89,7 +119,32 @@ class Trainer:
             channel_mults=tuple(cfg["model"]["channel_mults"]),
             num_attn_blocks_from_bottom=int(cfg["model"]["num_attn_blocks_from_bottom"]),
         ).to(self.device)
-        self.ema = EMA(self.model, decay=float(cfg["train"]["ema_decay"])).to(self.device)
+
+        # Memory knobs (best-effort: silently skip if the installed diffusers
+        # version doesn't expose the API).
+        attn_slice = cfg["train"].get("attention_slice", None)
+        if attn_slice is not None and hasattr(self.model, "set_attention_slice"):
+            try:
+                self.model.set_attention_slice(attn_slice)
+                print(f"[trainer] attention slicing -> {attn_slice}")
+            except Exception as e:
+                print(f"[warn] set_attention_slice({attn_slice}) failed: {e}")
+
+        if bool(cfg["train"].get("gradient_checkpointing", False)):
+            if hasattr(self.model, "enable_gradient_checkpointing"):
+                try:
+                    self.model.enable_gradient_checkpointing()
+                    print("[trainer] gradient checkpointing enabled (diffusers builtin)")
+                except Exception as e:
+                    print(f"[warn] enable_gradient_checkpointing failed: {e}")
+            else:
+                # diffusers 0.14 UNet2DModel has no builtin -- patch each block.
+                _patch_gradient_checkpointing(self.model)
+                print("[trainer] gradient checkpointing enabled (manual block-wrap)")
+
+        ema_device = self.device if bool(cfg["train"].get("ema_on_gpu", True)) else torch.device("cpu")
+        self.ema = EMA(self.model, decay=float(cfg["train"]["ema_decay"])).to(ema_device)
+        self.ema_device = ema_device
 
         # ----- Diffusion scheduler -----
         self.scheduler = DDPMScheduler(
@@ -121,8 +176,17 @@ class Trainer:
         os.makedirs(cfg["paths"]["ckpt_dir"], exist_ok=True)
         os.makedirs(cfg["paths"]["samples_dir"], exist_ok=True)
 
+        self.grad_accum = max(1, int(cfg["train"].get("grad_accum", 1)))
         self.global_step = 0
         self.best_loss = float("inf")
+        self._micro_step = 0    # micro-batch counter for gradient accumulation
+
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            free_b, total_b = torch.cuda.mem_get_info()
+            print(f"[trainer] CUDA mem: free={free_b/2**30:.2f} GiB / total={total_b/2**30:.2f} GiB")
+            n_params = sum(p.numel() for p in self.model.parameters())
+            print(f"[trainer] UNet params: {n_params/1e6:.1f} M")
 
     # ------------------------------------------------------------------ step
 
@@ -159,17 +223,29 @@ class Trainer:
             loss = (sq * weight_map).sum() / (weight_map.sum() + 1e-8)
         return loss
 
-    def _train_step(self, batch) -> float:
-        loss = self._forward_loss(batch)
-        self.optim.zero_grad(set_to_none=True)
+    def _train_step(self, batch) -> (float, bool):
+        """One micro-batch step. Returns (loss, optimizer_stepped).
+
+        Optimizer + EMA only fire once every `grad_accum` micro-batches so the
+        effective batch is `batch_size * grad_accum` while peak VRAM stays at
+        the per-micro-batch level.
+        """
+        if self._micro_step == 0:
+            self.optim.zero_grad(set_to_none=True)
+        loss = self._forward_loss(batch) / float(self.grad_accum)
         self.scaler.scale(loss).backward()
-        self.scaler.unscale_(self.optim)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(),
-                                       float(self.cfg["train"]["grad_clip"]))
-        self.scaler.step(self.optim)
-        self.scaler.update()
-        self.ema.update(self.model)
-        return float(loss.detach().item())
+        self._micro_step += 1
+        stepped = False
+        if self._micro_step >= self.grad_accum:
+            self.scaler.unscale_(self.optim)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                           float(self.cfg["train"]["grad_clip"]))
+            self.scaler.step(self.optim)
+            self.scaler.update()
+            self.ema.update(self.model)
+            self._micro_step = 0
+            stepped = True
+        return float(loss.detach().item()) * float(self.grad_accum), stepped
 
     # ------------------------------------------------------------------ loop
 
@@ -184,7 +260,8 @@ class Trainer:
         t0 = time.time()
         print(f"[trainer] device={self.device} | artifact={self.cfg['model']['artifact']} "
               f"| #train images={len(self.dataset)} | image_size={self.cfg['data']['image_size']} "
-              f"| batch={self.cfg['train']['batch_size']}")
+              f"| batch={self.cfg['train']['batch_size']} | grad_accum={self.grad_accum} "
+              f"| effective_batch={int(self.cfg['train']['batch_size']) * self.grad_accum}")
 
         while self.global_step < steps:
             try:
@@ -193,7 +270,9 @@ class Trainer:
                 loader_iter = iter(self.loader)
                 batch = next(loader_iter)
 
-            loss = self._train_step(batch)
+            loss, stepped = self._train_step(batch)
+            if not stepped:
+                continue                # accumulating; do not advance global_step yet
             running.append(loss)
             self.global_step += 1
 
@@ -254,6 +333,11 @@ class Trainer:
     def _sample_and_log(self, max_samples: Optional[int] = None):
         out_dir = os.path.join(self.cfg["paths"]["samples_dir"],
                                f"{self.cfg['model']['artifact']}_step_{self.global_step:06d}")
+        # If EMA lives on CPU, temporarily move it to the sampling device.
+        ema_was = next(self.ema.ema_model.parameters()).device
+        if ema_was != self.device:
+            self.ema.ema_model.to(self.device)
+        sampling_ok = True
         try:
             generate_samples(
                 cfg=self.cfg,
@@ -265,6 +349,13 @@ class Trainer:
             )
         except Exception as e:
             print(f"[warn] sampling failed at step {self.global_step}: {e}")
+            sampling_ok = False
+        finally:
+            if ema_was != self.device:
+                self.ema.ema_model.to(ema_was)
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+        if not sampling_ok:
             return
         if self.wandb is not None:
             try:

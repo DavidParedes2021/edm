@@ -21,7 +21,8 @@ model:
 
 train:
   device: cuda
-  batch_size: 8
+  batch_size: 4                   # safe on a 16 GB DGX. Raise to 6/8 if free VRAM allows.
+  grad_accum: 2                   # effective batch = batch_size * grad_accum = 8
   num_steps: 30000
   lr: 1.0e-4
   ema_decay: 0.999
@@ -37,6 +38,10 @@ train:
   sample_every: 1000
   save_every: 1000
   seed: 42
+  # ---- memory knobs ----
+  attention_slice: auto           # auto | 1 | <int> | null  (slice attention for VRAM)
+  gradient_checkpointing: true    # trade compute for activation memory
+  ema_on_gpu: true                # set false to put the EMA copy on CPU and save ~param-bytes
 
 sample:
   num_inference_steps: 50
