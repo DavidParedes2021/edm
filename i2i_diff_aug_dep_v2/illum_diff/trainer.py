@@ -87,11 +87,15 @@ class Trainer:
         artifact = cfg["model"]["artifact"]
         data_dir = _resolve_data_dir(cfg)
 
+        blur_sigma_lf = float(cfg["data"].get("blur_sigma_lf", 0.0))
+        self.predict_lf_target = bool(cfg["train"].get("predict_lf_target", False))
+
         self.dataset = ArtifactInpaintingDataset(
             img_dir=data_dir,
             image_size=int(cfg["data"]["image_size"]),
             artifact=artifact,
             mask_cfg=cfg["mask"],
+            blur_sigma_lf=blur_sigma_lf,
         )
         self.loader = DataLoader(
             self.dataset,
@@ -108,6 +112,7 @@ class Trainer:
             artifact=artifact,
             mask_cfg=cfg["mask"],
             limit=int(cfg["sample"]["num_samples"]),
+            blur_sigma_lf=blur_sigma_lf,
         )
 
         # ----- Model + EMA -----
@@ -192,9 +197,18 @@ class Trainer:
 
     def _forward_loss(self, batch):
         L     = batch["L"].to(self.device, non_blocking=True)      # (B,1,H,W) [-1,1]
+        L_lf  = batch["L_lf"].to(self.device, non_blocking=True)   # (B,1,H,W) [-1,1]
         mask  = batch["mask"].to(self.device, non_blocking=True)   # (B,1,H,W) [0,1]
         d     = batch["depth"].to(self.device, non_blocking=True)  # (B,1,H,W) [0,1]
         valid = batch["valid"].to(self.device, non_blocking=True)  # (B,1,H,W) {0,1}
+
+        # The diffusion target is either the full L (legacy) or its low-frequency
+        # band (recommended). Predicting L_lf forces the model to spend its
+        # capacity on illumination shift instead of texture, which (a) sharpens
+        # the result, since texture is re-injected at sample time from the
+        # input frame, and (b) makes the exposure delta easier to learn from
+        # only a few hundred unpaired artifact frames.
+        L_target = L_lf if self.predict_lf_target else L
 
         B = L.shape[0]
         # CFG mask dropout: drop the conditional info (mask + L_known) on a fraction
@@ -202,15 +216,15 @@ class Trainer:
         drop = (torch.rand(B, device=self.device)
                 < float(self.cfg["train"]["mask_dropout_prob"])).float().view(B, 1, 1, 1)
         cond_mask = mask * (1.0 - drop)
-        L_known   = (1.0 - cond_mask) * L
+        L_known   = (1.0 - cond_mask) * L_target
 
         t = torch.randint(
             0,
             int(self.scheduler.config.num_train_timesteps),
             (B,), device=self.device, dtype=torch.long,
         )
-        noise = torch.randn_like(L)
-        L_noisy = self.scheduler.add_noise(L, noise, t)
+        noise = torch.randn_like(L_target)
+        L_noisy = self.scheduler.add_noise(L_target, noise, t)
 
         net_in = torch.cat([L_noisy, L_known, cond_mask, d], dim=1)  # (B,4,H,W)
 

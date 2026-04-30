@@ -1,23 +1,27 @@
-"""Inpainting-style DDIM sampler with classifier-free guidance.
+"""Inpainting-style DDIM sampler with CFG and texture-preserving HF re-injection.
 
 Pipeline at inference:
     1. Read normal frame -> RGB.
     2. RGB -> LAB (skimage). Keep (a*, b*) untouched. Take L*.
     3. Compute depth proxy + focal mask (depth-driven for normals).
-    4. Initialize L_T = mask * Gaussian noise + (1 - mask) * L_known.
-    5. Iterate DDIM with CFG over the artifact specialist:
-           cond = [L_t, (1-mask)*L_known, mask, depth]
-           uncond = [L_t, 0, 0, depth]
-           eps = eps_uncond + w * (eps_cond - eps_uncond)
-       and at each step replace the outside-mask region with q(L_known, t_next).
-    6. Hard substitution: L_final = mask * L_pred + (1-mask) * L_known.
-    7. (L_final, original a*, original b*) -> RGB. Save.
+    4. Decompose L into low-frequency (illumination) and high-frequency
+       (mucosa texture) bands using the same Gaussian sigma as training.
+    5. Run DDIM with CFG over the artifact specialist. The conditioning
+       uses the LF band when the model was trained with predict_lf_target.
+       At each step, the outside-mask region is forced to q(L_known, t_next)
+       (RePaint-style consistency).
+    6. Texture preservation: take only the LF band of the model's prediction
+       inside the mask, and re-inject the *normal frame's* HF on top. This
+       makes texture loss structurally impossible.
+    7. Hard substitution outside the mask -> bit-identical L there.
+    8. (L_final, original a*, original b*) -> RGB. Save.
 
-This guarantees:
+Guarantees by construction:
     - Chrominance preservation (a*, b* never touched).
-    - Outside-mask preservation (luminance is bit-identical).
-    - Strong, focalized artifact inside the mask (CFG amplifies the conditional
-      delta and the inpainting context restricts where it acts).
+    - Outside-mask L preservation (bit-identical).
+    - Mucosa texture preservation INSIDE the mask (HF taken from input).
+    - Diffusion is responsible only for the low-frequency illumination shift,
+      which is what made the over- and underexposure artifacts in the first place.
 """
 
 import os
@@ -29,6 +33,10 @@ from PIL import Image
 from diffusers import DDIMScheduler
 
 from . import color as colorm
+
+
+def _to_2d(t: torch.Tensor) -> np.ndarray:
+    return t.detach().squeeze(0).squeeze(0).cpu().numpy()
 
 
 @torch.no_grad()
@@ -50,6 +58,9 @@ def generate_samples(cfg: dict, model: torch.nn.Module, device: torch.device,
     cfg_scale = float(cfg["sample"]["cfg_scale"])
     do_resample = bool(cfg["sample"]["resample_known_at_each_step"])
     do_hard_sub = bool(cfg["sample"]["hard_substitute_outside"])
+    texture_preserve = bool(cfg["sample"].get("texture_preserve", True))
+    predict_lf = bool(cfg["train"].get("predict_lf_target", False))
+    blur_sigma_lf = float(cfg["data"].get("blur_sigma_lf", 0.0))
     artifact = cfg["model"]["artifact"]
 
     H = W = int(cfg["data"]["image_size"])
@@ -57,13 +68,21 @@ def generate_samples(cfg: dict, model: torch.nn.Module, device: torch.device,
     if max_samples is not None:
         n_show = min(n_show, int(max_samples))
 
+    print(f"[sampler] cfg_scale={cfg_scale} | predict_lf_target={predict_lf} "
+          f"| texture_preserve={texture_preserve} | blur_sigma_lf={blur_sigma_lf}")
+
     for idx in range(n_show):
         item = normal_dataset[idx]
-        L_known = item["L"].to(device).unsqueeze(0)         # (1,1,H,W)
-        mask    = item["mask"].to(device).unsqueeze(0)      # (1,1,H,W)
-        depth   = item["depth"].to(device).unsqueeze(0)     # (1,1,H,W)
+        L_full = item["L"].to(device).unsqueeze(0)          # (1,1,H,W) input L
+        L_lf   = item["L_lf"].to(device).unsqueeze(0)       # (1,1,H,W) input L's LF
+        mask   = item["mask"].to(device).unsqueeze(0)       # (1,1,H,W)
+        depth  = item["depth"].to(device).unsqueeze(0)      # (1,1,H,W)
         rgb_orig = item["rgb"].numpy()                       # (H,W,3) uint8
         ab_orig  = item["ab"].numpy()                        # (H,W,2) float32
+
+        # The "known" L the diffusion was conditioned on at TRAINING time:
+        # full L if the model was trained on L, blurred L if it was trained on L_lf.
+        L_known = L_lf if predict_lf else L_full
 
         # Initialize: noise inside the mask, known L outside.
         x = torch.randn((1, 1, H, W), device=device)
@@ -98,14 +117,33 @@ def generate_samples(cfg: dict, model: torch.nn.Module, device: torch.device,
 
             x = x_new
 
-        L_pred = x.clamp(-1.0, 1.0).squeeze(0).squeeze(0).cpu().numpy()
-        if do_hard_sub:
-            mask_np    = mask.squeeze(0).squeeze(0).cpu().numpy()
-            L_known_np = L_known.squeeze(0).squeeze(0).cpu().numpy()
-            L_final_pm1 = mask_np * L_pred + (1.0 - mask_np) * L_known_np
-        else:
-            L_final_pm1 = L_pred
+        # ---- Texture-preserving recombination ----------------------------------
+        # Take the LOW-frequency band of the diffusion's prediction inside the mask
+        # (= the illumination shift the model learned), and add the HIGH-frequency
+        # band of the original normal frame (= mucosa texture). Outside the mask,
+        # use the original L verbatim.
+        L_pred = _to_2d(x.clamp(-1.0, 1.0))
+        L_full_np = _to_2d(L_full)
+        L_lf_np   = _to_2d(L_lf)
+        mask_np   = _to_2d(mask)
 
+        if texture_preserve and blur_sigma_lf > 0.0:
+            from scipy.ndimage import gaussian_filter
+            # If the model was trained on L_lf, its output is already (approximately)
+            # band-limited; blurring is a no-op-ish safety net. If the model was
+            # trained on L, blurring discards the (suspect) HF it tried to generate.
+            L_pred_lf = gaussian_filter(L_pred, sigma=blur_sigma_lf, mode="reflect").astype(np.float32)
+            L_normal_hf = (L_full_np - L_lf_np).astype(np.float32)
+            L_inside = L_pred_lf + L_normal_hf
+        else:
+            L_inside = L_pred
+
+        if do_hard_sub:
+            L_final_pm1 = mask_np * L_inside + (1.0 - mask_np) * L_full_np
+        else:
+            L_final_pm1 = L_inside
+
+        L_final_pm1 = np.clip(L_final_pm1, -1.0, 1.0)
         L_final_0_100 = colorm.denormalize_L(L_final_pm1)
         rgb_out = colorm.lab_to_rgb(L_final_0_100, ab_orig)
 
@@ -113,10 +151,10 @@ def generate_samples(cfg: dict, model: torch.nn.Module, device: torch.device,
             os.path.join(out_dir, f"sample_{idx:02d}_normal.png"))
         Image.fromarray(rgb_out).save(
             os.path.join(out_dir, f"sample_{idx:02d}_{artifact}.png"))
-        m_viz = (mask.squeeze().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        m_viz = (mask_np * 255.0).clip(0, 255).astype(np.uint8)
         Image.fromarray(m_viz).save(
             os.path.join(out_dir, f"sample_{idx:02d}_mask.png"))
-        d_viz = (depth.squeeze().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        d_viz = (_to_2d(depth) * 255.0).clip(0, 255).astype(np.uint8)
         Image.fromarray(d_viz).save(
             os.path.join(out_dir, f"sample_{idx:02d}_depth.png"))
 

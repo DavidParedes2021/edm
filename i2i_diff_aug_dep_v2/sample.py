@@ -70,12 +70,25 @@ def main():
         print(f"[sample] loaded bare state_dict from {args.ckpt}")
     model.eval()
 
+    # Inherit the LF/target settings the model was actually TRAINED with so
+    # we don't accidentally sample an old (full-L) checkpoint as if it were
+    # an LF model, or vice-versa.
+    ckpt_cfg = state.get("config") if isinstance(state, dict) else None
+    if isinstance(ckpt_cfg, dict):
+        train_predict_lf = bool(ckpt_cfg.get("train", {}).get("predict_lf_target", False))
+        train_sigma_lf = float(ckpt_cfg.get("data", {}).get("blur_sigma_lf", 0.0))
+        cfg["train"]["predict_lf_target"] = train_predict_lf
+        cfg["data"]["blur_sigma_lf"]      = train_sigma_lf
+        print(f"[sample] checkpoint trained with predict_lf_target={train_predict_lf}, "
+              f"blur_sigma_lf={train_sigma_lf}")
+
     normal_ds = NormalSampleDataset(
         img_dir=cfg["data"]["normal_dir"],
         image_size=int(cfg["data"]["image_size"]),
         artifact=args.artifact,
         mask_cfg=cfg["mask"],
         limit=int(cfg["sample"]["num_samples"]),
+        blur_sigma_lf=float(cfg["data"].get("blur_sigma_lf", 0.0)),
     )
 
     out_dir = args.out_dir or os.path.join(cfg["paths"]["samples_dir"], f"final_{args.artifact}")
