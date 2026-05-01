@@ -270,6 +270,10 @@ python depth_estimator.py \
 
 python depth_estimator.py --input_dir "../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" --output_dir "../../../../projects/i2i_diff_aug_dep/outputs/depts"  --model_id depth-anything/Depth-Anything-V2-Small-hf
 
+
+python depth_estimator.py --input_dir "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"  --output_dir "../../../projects/i2i_diff_aug_dep_v3/outputs/depts"
+
+
 # 3. Regenerate paired training data (now depth-aware)
 python generate_pairs.py \
     --normal_dir ./data/normal \
@@ -277,7 +281,7 @@ python generate_pairs.py \
     --output_dir ./data/pairs \
     --num_variants 3
 
-python generate_pairs.py --normal_dir "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" --depth_dir "../../../projects/i2i_diff_aug_dep/outputs/depts" --output_dir "../../../projects/i2i_diff_aug_dep/outputs/pairs" --num_variants 3
+python generate_pairs.py --normal_dir "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames" --depth_dir "../../../projects/i2i_diff_aug_dep_v3/outputs/depts" --output_dir "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs" --num_variants 3
 
 # 4. Train (config already points to the new pairs dir)
 python diffusion_train.py --config diffusion_config.yaml

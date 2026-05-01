@@ -1,0 +1,14 @@
+# Pinned to user's existing environment.
+# torch is assumed already installed (paired with torchvision==0.12.0+cu113 -> torch 1.11.0+cu113).
+diffusers==0.14.0
+huggingface_hub==0.25.2
+accelerate==0.18.0
+transformers==4.27.4
+wandb==0.14.2
+Pillow==9.5.0
+numpy==1.23.5
+tqdm==4.65.0
+matplotlib==3.7.1
+packaging==23.1
+torchvision==0.12.0+cu113
+PyYAML>=6.0

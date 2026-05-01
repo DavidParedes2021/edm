@@ -1,0 +1,76 @@
+# ============================================================
+# YCLDI: YCbCr-Conditioned Luminance Diffusion (config)
+# ============================================================
+# Single source of truth for paths, hyper-parameters, and runtime knobs.
+# Override individual values from the CLI if you wish (see train.py / infer.py).
+
+project:
+  name: ycldi_v1
+  seed: 42
+
+# --- Input data paths -----------------------------------------------------
+paths:
+  normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"         # 504 frames
+  over_dir:  "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"   # 281 frames
+  under_dir:  "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"     # 817 frames
+
+# --- Output paths ---------------------------------------------------------
+# checkpoints, samples and logs are derived as <root>/checkpoints, etc.
+output:
+  root: "../../../projects/diff_dep_v4/outputs"
+
+# --- Data ----------------------------------------------------------------
+data:
+  image_size: 256                              # 256 fits 16GB DGX with batch 8 in fp16
+  num_workers: 4
+  augment: true                                # horizontal flip only (endoscopy-safe)
+  val_fraction: 0.05
+
+# --- Model (1-channel class-conditional UNet) ----------------------------
+model:
+  block_out_channels: [128, 128, 256, 256, 512]
+  layers_per_block: 2
+  attention_head_dim: 8
+  norm_num_groups: 32
+  resnet_time_scale_shift: scale_shift         # AdaGN-style modulation
+
+# --- Noise schedule ------------------------------------------------------
+scheduler:
+  num_train_timesteps: 1000
+  beta_schedule: scaled_linear
+  beta_start: 0.0001
+  beta_end: 0.02
+  prediction_type: epsilon
+
+# --- Training ------------------------------------------------------------
+train:
+  batch_size: 8                                # DGX 16 GB
+  num_epochs: 200
+  lr: 1.0e-4
+  lr_warmup_steps: 500
+  weight_decay: 1.0e-6
+  gradient_accumulation: 1
+  gradient_checkpointing: false                # set true on 4 GB local
+  ema_decay: 0.9999
+  class_dropout_prob: 0.1                      # required for CFG
+  mixed_precision: fp16
+  log_every: 50
+  sample_every: 1                              # epochs between training samples
+  ckpt_every: 1                                # always saves "last"; "best" tracked by val loss
+
+# --- Inference (SDEdit + RePaint with depth-aware mask) ------------------
+inference:
+  ddim_steps: 50
+  cfg_scale: 6.0                               # higher = stronger exposure change
+  cfg_negative_class: normal                   # 'normal' (contrastive) or 'null' (standard CFG)
+  sdedit_strength: 0.55                        # 0..1; fraction of timesteps to noise the input
+  use_depth_mask: true
+  mask_blend_strength: 0.9                     # caps the mask at this value (lower = softer focal)
+  mask_gamma: 1.5                              # >1 sharpens the focal cluster
+  save_debug: true                             # also dump the masks and depth for inspection
+
+# --- W&B (optional) ------------------------------------------------------
+wandb:
+  enabled: false
+  project: ycldi
+  entity: null
