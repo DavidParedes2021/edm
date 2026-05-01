@@ -17,18 +17,25 @@ from diffusers import UNet2DModel
 
 # Order of (down/up) block types in this 5-level UNet:
 #   resolution per level: 256 -> 128 -> 64 -> 32 -> 16 -> mid(8)
-#   attention placed only at the deepest non-bottleneck level (16 -> down,
-#   32 -> up) to keep VRAM low; the mid block has its own self-attention.
+#
+# Self-attention is *only* in the mid block (8x8 = 64 tokens, ~free) -- it is
+# added automatically by UNet2DModel at the bottleneck. We deliberately do
+# NOT use AttnDown/AttnUpBlock2D anywhere on the sides: at 32x32 the attention
+# has 1024 tokens, and diffusers casts the softmax to fp32, so for batch 8
+# with 32 heads the scores tensor alone is 8 * 32 * 1024 * 1024 * 4 B = 1 GiB.
+# That's exactly the cumulative footprint that OOMs a 16 GB GPU during the
+# up-path under AMP. For Y-only luminance diffusion the bottleneck attention
+# is enough; nothing on the sides needs global mixing.
 _DOWN_BLOCK_TYPES = (
     "DownBlock2D",
     "DownBlock2D",
     "DownBlock2D",
-    "AttnDownBlock2D",
+    "DownBlock2D",
     "DownBlock2D",
 )
 _UP_BLOCK_TYPES = (
     "UpBlock2D",
-    "AttnUpBlock2D",
+    "UpBlock2D",
     "UpBlock2D",
     "UpBlock2D",
     "UpBlock2D",

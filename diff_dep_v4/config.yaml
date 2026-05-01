@@ -44,12 +44,12 @@ scheduler:
 
 # --- Training ------------------------------------------------------------
 train:
-  batch_size: 8                                # DGX 16 GB
+  batch_size: 4                                # DGX 16 GB
   num_epochs: 200
   lr: 1.0e-4
   lr_warmup_steps: 500
   weight_decay: 1.0e-6
-  gradient_accumulation: 1
+  gradient_accumulation: 2
   gradient_checkpointing: false                # set true on 4 GB local
   ema_decay: 0.9999
   class_dropout_prob: 0.1                      # required for CFG
@@ -57,6 +57,7 @@ train:
   log_every: 50
   sample_every: 1                              # epochs between training samples
   ckpt_every: 1                                # always saves "last"; "best" tracked by val loss
+  gradient_checkpointing: true
 
 # --- Inference (SDEdit + RePaint with depth-aware mask) ------------------
 inference:
