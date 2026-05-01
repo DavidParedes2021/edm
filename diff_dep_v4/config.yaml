@@ -10,14 +10,14 @@ project:
 
 # --- Input data paths -----------------------------------------------------
 paths:
-  normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"         # 504 frames
-  over_dir:  "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"   # 281 frames
-  under_dir:  "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"     # 817 frames
+  normal_dir: "../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"         # 504 frames
+  over_dir:  "../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/overexposed_frames"   # 281 frames
+  under_dir:  "../../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"     # 817 frames
 
 # --- Output paths ---------------------------------------------------------
 # checkpoints, samples and logs are derived as <root>/checkpoints, etc.
 output:
-  root: "../../../projects/diff_dep_v4/outputs"
+  root: "../../../../projects/diff_dep_v4/outputs"
 
 # --- Data ----------------------------------------------------------------
 data:
