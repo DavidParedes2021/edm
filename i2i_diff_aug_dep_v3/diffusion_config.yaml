@@ -1,0 +1,152 @@
+# ============================================================
+# Depth-Aware Paired Luminance Diffusion — Config (split-domain)
+# ============================================================
+# Conditional DDPM on L channel, with depth conditioning.
+#   input  = concat(noisy_target_L, source_L, depth) → 3 channels
+#   output = predicted noise on target_L              → 1 channel
+#
+# A SINGLE model is trained per direction (overexposed OR underexposed).
+# Run training twice with `domain: overexposed` and `domain: underexposed`
+# to obtain two specialised checkpoints — this eliminates the leakage
+# failure mode where one image showed both effects, and lets each model
+# fully commit to its direction without a class embedding compromising
+# the backbone weights.
+#
+# One-time setup before training:
+#   python depth_estimator.py --input_dir <normal> --output_dir <depth>
+#   python generate_pairs.py  --normal_dir <normal> --depth_dir <depth> \
+#                             --output_dir <pairs> --num_variants 3
+#
+# Then train per domain:
+#   python diffusion_train.py --config diffusion_config.yaml \
+#       --domain underexposed --output_subdir under
+#   python diffusion_train.py --config diffusion_config.yaml \
+#       --domain overexposed  --output_subdir over
+
+# --- Which exposure direction this run targets ---
+# 'overexposed' or 'underexposed'. Override on CLI with --domain.
+domain: "underexposed"
+
+# --- Data paths ---
+data:
+  pairs_dir: "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs"
+  normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
+  depth_dir:  "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs/depth"
+
+# --- Output paths ---
+# Each per-domain training run writes into a sub-directory of `root`
+# named after `domain` (overridable via --output_subdir).
+output:
+  root: "../../../projects/i2i_diff_aug_dep_v3/outputs"
+  checkpoints_dir: "../../../projects/i2i_diff_aug_dep_v3/outputs/checkpoints"
+  samples_dir: "../../../projects/i2i_diff_aug_dep_v3/outputs/samples"
+
+# --- Image settings ---
+image:
+  size: 256
+
+# --- Model ---
+# 3 input channels: noisy target L + clean source L + depth
+# num_class_embeds is intentionally null — we train one specialised model
+# per direction, so there is no class to condition on. Forward calls pass
+# class_labels=None.
+model:
+  in_channels: 3
+  out_channels: 1
+  block_out_channels: [64, 128, 192, 256]
+  layers_per_block: 2
+  down_block_types:
+    - "DownBlock2D"
+    - "DownBlock2D"
+    - "DownBlock2D"
+    - "AttnDownBlock2D"
+  up_block_types:
+    - "AttnUpBlock2D"
+    - "UpBlock2D"
+    - "UpBlock2D"
+    - "UpBlock2D"
+  num_class_embeds: null
+  attention_head_dim: 16
+
+  # FiLM modulation on 4-D depth stats [mean, std, p10, p90] → time-embed.
+  # Last layer is zero-initialised so training starts identical to
+  # the no-FiLM baseline. Toggle on after a first successful run.
+  depth_film: false
+  depth_film_hidden: 64
+
+# --- Diffusion ---
+diffusion:
+  num_train_timesteps: 1000
+  beta_schedule: "squaredcos_cap_v2"
+  prediction_type: "epsilon"
+
+# --- Training ---
+training:
+  epochs: 300
+  batch_size: 4
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  grad_accum_steps: 1
+  mixed_precision: true
+  ema_decay: 0.9999
+  num_workers: 4
+  save_every_n_epochs: 10
+  patience: 50
+
+  # Robustness augmentations.
+  gamma_jitter: 0.1
+  depth_noise_sigma: 0.05   # bumped — stress-test against depth-estimator error
+
+# --- Losses ---
+losses:
+  mse_weight: 1.0
+  l1_weight: 0.1
+  edge_weight: 0.03
+
+  # Extreme-weighted L1 — single knob; the loss automatically uses
+  # mode='dark' if domain='underexposed', mode='bright' if 'overexposed'.
+  # Heavily upweights pixels at the target's extreme to crush the
+  # mean-regression bias responsible for "barely noticeable" effects.
+  extreme_weight: 0.50      # was dark_weight=0.15
+  extreme_alpha:  5.0       # was 3.0
+  extreme_tau:    0.3
+
+  # Depth-gradient consistency — keeps exposure falloff aligned with geometry.
+  depth_grad_weight: 0.05
+  dgrad_margin:      0.1
+
+  # SNR gating for x0-space aux losses. Bumped to 0.75 so the dark/bright
+  # signal reaches a larger fraction of timesteps without triggering the
+  # high-t fp16-instability.
+  aux_max_t_frac: 0.75
+
+# --- Chroma attenuation (post-hoc, non-learned) ---
+chroma:
+  sat_knee:           5.0
+  sat_full:          40.0
+  sat_floor:          0.10
+  depth_chroma_boost: 0.30
+  highlight_desat:    0.60
+  highlight_knee:    90.0
+  purkinje_b_shift:   1.5
+  purkinje_threshold: 20.0
+
+# --- Texture-gate post-process (recombination) ---
+# Attenuates the original high-frequency texture in regions where the
+# predicted L_low is at an extreme. Without this, re-adding L_high_orig
+# brings mid-tone variance back into the deepest cores and undoes the
+# darkening / brightening — the dominant cause of "weak" effects.
+texture_gate:
+  knee:  30.0   # ramp width in L units
+  floor: 0.05   # min HF multiplier in deepest extreme
+
+# --- Inference ---
+inference:
+  num_inference_steps: 50
+  batch_size: 1
+
+# --- Logging ---
+logging:
+  use_wandb: false
+  wandb_project: "depth-aware-exposure-diffusion"
+  wandb_entity: null
