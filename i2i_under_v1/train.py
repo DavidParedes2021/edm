@@ -279,6 +279,8 @@ def main():
 
         # Sampling
         if (epoch + 1) % sample_every == 0 or epoch == 0:
+            prev = None
+            grid = None
             try:
                 # Use EMA weights for visualization
                 prev = ema.apply_to(model)
@@ -292,6 +294,13 @@ def main():
                 print(f"saved sample grid -> {samples_dir / f'epoch_{epoch:04d}.png'}")
             except Exception as e:
                 print(f"[warn] sampling failed: {e}")
+            finally:
+                # Release the EMA weight backup and any GPU tensors held by
+                # the sampling pass before the next epoch's backward, otherwise
+                # fragmentation from sampling can OOM the first training step.
+                del prev, grid
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # Checkpoint (use eps_mse as the metric; lower is better)
         metric = avg.get('eps_mse', None) if running == {} else None
