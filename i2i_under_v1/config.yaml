@@ -1,0 +1,50 @@
+# YCLDI underexposure config.
+# Single source of truth for paths, model, training, inference, and outputs.
+
+seed: 0
+
+data:
+  normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"               # change me
+  underexposed_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/underexposed_frames"
+  image_size: 256
+  num_workers: 4
+  balance: true                                   # up-sample the minority class
+
+model:
+  base_channels: 64
+  channel_mults: [1, 2, 3, 4]                     # 64, 128, 192, 256
+  num_res_blocks: 2
+  attention_resolutions: [32]                     # attention at 32x32 only
+  dropout: 0.1
+
+diffusion:
+  num_train_timesteps: 1000
+  schedule: cosine
+
+training:
+  batch_size: 8
+  grad_accum_steps: 2                             # effective batch 16
+  num_epochs: 200
+  lr: 1.0e-4
+  weight_decay: 0.0
+  ema_decay: 0.9999
+  cfg_dropout: 0.1
+  mixed_precision: fp16
+  gradient_checkpointing: false                   # turn on if VRAM is tight
+
+loss:
+  lambda_eps:  1.0                                # primary DDPM objective
+  lambda_l1:   0.1                                # x0 reconstruction
+  lambda_grad: 0.1                                # sharpness / edge preservation
+  lambda_vgg:  0.05                               # perceptual (VGG16, fp32)
+  lambda_hist: 0.05                               # 1D Wasserstein on luminance histogram
+  use_vgg:     true
+
+inference:
+  num_inference_steps: 50
+  cfg_scale: 2.5
+
+output:
+  base_dir: "../../../projects/i2i_under_v1/outputs"
+  log_every_steps: 50
+  sample_every_epochs: 5
