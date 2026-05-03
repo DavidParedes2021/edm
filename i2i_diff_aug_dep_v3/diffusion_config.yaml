@@ -23,23 +23,39 @@
 #   python diffusion_train.py --config diffusion_config.yaml \
 #       --domain overexposed  --output_subdir over
 
-# --- Which exposure direction this run targets ---
-# 'overexposed' or 'underexposed'. Override on CLI with --domain.
+# ============================================================
+# THE ONE KNOB FOR THIS RUN — flip this to switch directions.
+# ============================================================
+# 'underexposed' → train/infer the dark-cavity model.
+# 'overexposed'  → train/infer the bright-near-tissue model.
+#
+# Pairs are generated for BOTH directions in a single
+# `generate_pairs.py` run, so you don't have to regenerate
+# data when switching. Each direction saves its checkpoints
+# under  output.checkpoints_dir / <domain>/  automatically,
+# so the two trainings won't overwrite each other.
+#
+# CLI override: pass `--domain overexposed` or
+# `--domain underexposed` to either diffusion_train.py or
+# diffusion_inference.py to override this field for one run.
 domain: "underexposed"
 
 # --- Data paths ---
 data:
-  pairs_dir: "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs"
-  normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
-  depth_dir:  "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs/depth"
+  #pairs_dir: "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs"
+  #normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
+  #depth_dir:  "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs/depth"
+  pairs_dir: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs"
+  normal_dir: "../../../data/datasets/kvasir_classified/none"
+  depth_dir:  "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
 
 # --- Output paths ---
 # Each per-domain training run writes into a sub-directory of `root`
 # named after `domain` (overridable via --output_subdir).
 output:
-  root: "../../../projects/i2i_diff_aug_dep_v3/outputs"
-  checkpoints_dir: "../../../projects/i2i_diff_aug_dep_v3/outputs/checkpoints"
-  samples_dir: "../../../projects/i2i_diff_aug_dep_v3/outputs/samples"
+  root: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs"
+  checkpoints_dir: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/checkpoints"
+  samples_dir: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/samples"
 
 # --- Image settings ---
 image:
@@ -139,6 +155,28 @@ chroma:
 texture_gate:
   knee:  30.0   # ramp width in L units
   floor: 0.05   # min HF multiplier in deepest extreme
+
+# --- Content mask (UI / letterbox passthrough) ---
+# Endoscopy frames have UI panels and circular FOV masks. The model has
+# no useful conditioning on those pure-black regions and outputs noise
+# there. We detect the valid scene area from the original RGB and force
+# everything outside it to the original pixels.
+content_mask:
+  enable:         true
+  luma_threshold: 8.0   # Rec.601 luma below which a pixel is 'border'
+  erode_iter:     2     # erode the boundary slightly to avoid edge bleed
+
+# --- Focal blend (force underexposure to stay in deep zones only) ---
+# Even inside the FOV the model can leak the effect onto mid-depth tissue
+# near the light source. A depth-driven blend weight lets the model fully
+# act only in the deepest regions and falls off to the original L
+# elsewhere. alpha(d) = ((farness - knee) / (1 - knee))^gamma in [floor, 1].
+focal_blend:
+  enable:       true
+  gamma:        2.5   # higher = more concentrated peak at the deepest pixel
+  knee:         0.05  # dead-zone (no effect) for the bottom 5% of farness
+  floor:        0.0   # min α; 0 = fully suppress effect on near tissue
+  smooth_sigma: 4.0   # gaussian smoothing of α (px at 512px ref)
 
 # --- Inference ---
 inference:

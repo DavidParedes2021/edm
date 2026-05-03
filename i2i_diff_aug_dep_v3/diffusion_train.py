@@ -63,6 +63,11 @@ from losses import (
     DepthGradientConsistencyLoss,
 )
 from chroma_attenuation import attenuate_chroma, texture_gate
+from inference_postprocess import (
+    detect_content_mask,
+    clean_depth_with_mask,
+    focal_blend_alpha,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -91,6 +96,52 @@ class EMAModel:
 
     def load_state_dict(self, sd):
         self.shadow = {k: v.clone() for k, v in sd.items()}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Checkpoint compatibility — diffusers attention key migration (pre-0.18 →)
+# ═══════════════════════════════════════════════════════════════════════════
+# Older `diffusers` versions named attention parameters
+#   *.attentions.N.query.weight, .key.*, .value.*, .proj_attn.*
+# while current versions use
+#   *.attentions.N.to_q.weight, .to_k.*, .to_v.*, .to_out.0.*
+# Loading an old checkpoint into a freshly-built UNet therefore raises a
+# missing-keys / unexpected-keys RuntimeError. The translator below renames
+# only attention-block tensors so legacy checkpoints load unchanged.
+
+_LEGACY_ATTN_RENAMES = (
+    (".query.weight",     ".to_q.weight"),
+    (".query.bias",       ".to_q.bias"),
+    (".key.weight",       ".to_k.weight"),
+    (".key.bias",         ".to_k.bias"),
+    (".value.weight",     ".to_v.weight"),
+    (".value.bias",       ".to_v.bias"),
+    (".proj_attn.weight", ".to_out.0.weight"),
+    (".proj_attn.bias",   ".to_out.0.bias"),
+)
+
+
+def translate_legacy_attn_keys(state_dict: dict) -> dict:
+    """Return a copy of `state_dict` with legacy attention key names rewritten.
+
+    Only keys containing `.attentions.` are touched; everything else passes
+    through verbatim. Safe to call on already-modern state dicts (no-op).
+    """
+    out = {}
+    renamed = 0
+    for k, v in state_dict.items():
+        new_k = k
+        if ".attentions." in k:
+            for old, new in _LEGACY_ATTN_RENAMES:
+                if new_k.endswith(old):
+                    new_k = new_k[: -len(old)] + new
+                    renamed += 1
+                    break
+        out[new_k] = v
+    if renamed:
+        print(f"[ckpt] translated {renamed} legacy diffusers attention keys "
+              f"(query/key/value/proj_attn -> to_q/to_k/to_v/to_out.0)")
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -228,9 +279,10 @@ def build_model(cfg: dict, device: torch.device):
 @torch.no_grad()
 def generate_samples(model, scheduler_cfg, inference_cfg, normal_loader,
                      device, epoch, output_dir, image_size,
-                     chroma_cfg, domain, tex_gate_cfg, num_samples=4):
+                     chroma_cfg, domain, tex_gate_cfg, num_samples=4,
+                     focal_blend_cfg=None, content_mask_cfg=None):
     """Single-domain DDIM denoising → texture reinjection (with HF gate) →
-    chroma attenuation → RGB. `domain` selects 'overexposed' / 'underexposed'."""
+    focal blend + content-mask passthrough → chroma attenuation → RGB."""
     model.eval()
     ddim = DDIMScheduler(
         num_train_timesteps=scheduler_cfg["num_train_timesteps"],
@@ -245,19 +297,65 @@ def generate_samples(model, scheduler_cfg, inference_cfg, normal_loader,
     tg_knee = float(tex_gate_cfg.get("knee", 30.0))
     tg_floor = float(tex_gate_cfg.get("floor", 0.05))
 
+    fb_cfg = focal_blend_cfg or {}
+    fb_enable = bool(fb_cfg.get("enable", True))
+    fb_gamma = float(fb_cfg.get("gamma", 2.5))
+    fb_knee = float(fb_cfg.get("knee", 0.05))
+    fb_floor = float(fb_cfg.get("floor", 0.0))
+    fb_smooth = float(fb_cfg.get("smooth_sigma", 4.0))
+
+    cm_cfg = content_mask_cfg or {}
+    cm_enable = bool(cm_cfg.get("enable", True))
+    cm_threshold = float(cm_cfg.get("luma_threshold", 8.0))
+    cm_erode = int(cm_cfg.get("erode_iter", 2))
+
+    border_d = 1.0 if domain == "underexposed" else 0.0
+
     count = 0
     for source_L, depth, AB, L_orig, depth_full, paths, orig_hw in normal_loader:
         if count >= num_samples:
             break
-        source_L = source_L.to(device)
-        depth = depth.to(device)
         B = source_L.shape[0]
 
-        x = torch.randn_like(source_L)
+        # Per-sample content mask + cleaned depth (full resolution)
+        masks_full = []
+        depths_clean_full = []
+        for b in range(B):
+            H_o, W_o = int(orig_hw[0][b]), int(orig_hw[1][b])
+            d_o = depth_full[b].numpy().astype(np.float32)
+            rgb_orig = np.array(Image.open(paths[b]).convert("RGB"))
+            if rgb_orig.shape[:2] != (H_o, W_o):
+                rgb_orig = np.array(
+                    Image.fromarray(rgb_orig).resize((W_o, H_o), Image.BILINEAR)
+                )
+            if cm_enable:
+                m = detect_content_mask(rgb_orig,
+                                        luma_threshold=cm_threshold,
+                                        erode_iter=cm_erode)
+            else:
+                m = np.ones((H_o, W_o), dtype=bool)
+            d_clean = clean_depth_with_mask(d_o, m, border_value=border_d)
+            masks_full.append(m)
+            depths_clean_full.append(d_clean)
 
+        # Re-derive model-resolution depth from cleaned full depth
+        depths_clean_small = np.zeros((B, image_size, image_size), dtype=np.float32)
+        for b in range(B):
+            d_small = np.array(
+                Image.fromarray(depths_clean_full[b].astype(np.float32),
+                                mode="F").resize(
+                    (image_size, image_size), Image.LANCZOS),
+                dtype=np.float32,
+            )
+            depths_clean_small[b] = np.clip(d_small, 0.0, 1.0)
+        depth_t = torch.from_numpy(depths_clean_small * 2.0 - 1.0
+                                   ).unsqueeze(1).to(device)
+        source_L = source_L.to(device)
+
+        x = torch.randn_like(source_L)
         for t in ddim.timesteps:
             t_batch = torch.full((B,), t, dtype=torch.long, device=device)
-            model_input = torch.cat([x, source_L, depth], dim=1)
+            model_input = torch.cat([x, source_L, depth_t], dim=1)
             pred = model(model_input, t_batch, class_labels=None).sample
             x = ddim.step(pred, t, x).prev_sample
 
@@ -270,7 +368,8 @@ def generate_samples(model, scheduler_cfg, inference_cfg, normal_loader,
             H_o, W_o = int(orig_hw[0][b]), int(orig_hw[1][b])
             ab = AB[b].numpy()
             l_o = L_orig[b].numpy()
-            d_full = depth_full[b].numpy()
+            d_full = depths_clean_full[b]
+            mask = masks_full[b]
 
             L_pred_full = np.array(
                 Image.fromarray(L_pred_small[b].astype(np.float32), mode="F").resize(
@@ -280,18 +379,34 @@ def generate_samples(model, scheduler_cfg, inference_cfg, normal_loader,
             sigma = 3.0 * max(H_o, W_o) / 512.0
             L_high = l_o - gaussian_filter(l_o, sigma=sigma)
             L_low_pred = gaussian_filter(L_pred_full, sigma=sigma)
-            # HF gate: kill texture in extreme cores so dark stays dark
-            # / bright stays bright after recombination.
             hf_gate = texture_gate(L_low_pred, mode=domain,
                                    knee=tg_knee, floor=tg_floor)
-            L_final = np.clip(L_low_pred + hf_gate * L_high, 0.0, 100.0
+            L_model = np.clip(L_low_pred + hf_gate * L_high, 0.0, 100.0
                               ).astype(np.float32)
 
-            A_new, B_new = attenuate_chroma(
+            if fb_enable:
+                fb_smooth_px = fb_smooth * max(H_o, W_o) / 512.0
+                alpha = focal_blend_alpha(
+                    d_full, mode=domain,
+                    gamma=fb_gamma, knee=fb_knee, floor=fb_floor,
+                    smooth_sigma=fb_smooth_px,
+                )
+            else:
+                alpha = np.ones_like(L_model, dtype=np.float32)
+            alpha = alpha * mask.astype(np.float32)
+
+            L_final = (alpha * L_model + (1.0 - alpha) * l_o).astype(np.float32)
+            L_final = np.clip(L_final, 0.0, 100.0)
+
+            A_att, B_att = attenuate_chroma(
                 ab[..., 0], ab[..., 1],
                 L_new=L_final, L_orig=l_o, depth=d_full,
                 mode=domain, cfg=chroma_cfg,
             )
+            m_f = mask.astype(np.float32)
+            A_new = m_f * A_att + (1.0 - m_f) * ab[..., 0]
+            B_new = m_f * B_att + (1.0 - m_f) * ab[..., 1]
+
             lab = np.stack([L_final, A_new, B_new], axis=-1)
             rgb = lab_to_rgb(lab)
 
@@ -401,6 +516,10 @@ def train(cfg: dict, resume_path: str = None,
     best_loss = float("inf")
     if resume_path and os.path.isfile(resume_path):
         ck = torch.load(resume_path, map_location="cpu")
+        # Migrate legacy diffusers attention key names if present.
+        ck["model"] = translate_legacy_attn_keys(ck["model"])
+        if "ema" in ck:
+            ck["ema"] = translate_legacy_attn_keys(ck["ema"])
         try:
             model.load_state_dict(ck["model"])
         except RuntimeError:
@@ -607,6 +726,8 @@ def train(cfg: dict, resume_path: str = None,
                 domain=domain,
                 tex_gate_cfg=cfg.get("texture_gate", {}),
                 num_samples=4,
+                focal_blend_cfg=cfg.get("focal_blend", {}),
+                content_mask_cfg=cfg.get("content_mask", {}),
             )
             model.load_state_dict(orig_sd)
             print(f"  → samples saved to {samp_dir}")
