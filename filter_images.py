@@ -24,4 +24,4 @@ def copy_first_n_files(src_folder, dst_folder, n):
 
 
 # Example usage
-copy_first_n_files( r"../../data/datasets/kvasir_classified/none",  r"../../data/datasets/kvasir_classified/none_filtered", 10)
+copy_first_n_files( r"../../data/datasets/kvasir_classified/none",  r"../../data/datasets/kvasir_classified/none_filtered", 3791)
