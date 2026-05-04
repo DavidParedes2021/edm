@@ -38,7 +38,7 @@
 # CLI override: pass `--domain overexposed` or
 # `--domain underexposed` to either diffusion_train.py or
 # diffusion_inference.py to override this field for one run.
-domain: "underexposed"
+domain: "overexposed"
 
 # --- Data paths ---
 data:
