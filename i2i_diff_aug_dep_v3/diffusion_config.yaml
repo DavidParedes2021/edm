@@ -45,17 +45,22 @@ data:
   #pairs_dir: "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs"
   #normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
   #depth_dir:  "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs/depth"
-  pairs_dir: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs"
-  normal_dir: "../../../data/datasets/kvasir_classified/none"
-  depth_dir:  "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
+  
+  #pairs_dir: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs"
+  #normal_dir: "../../../data/datasets/kvasir_classified/none"
+  #depth_dir:  "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
+  
+  pairs_dir: "../../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs"
+  normal_dir: "../../../../data/datasets/kvasir_classified/none"
+  depth_dir:  "../../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
 
 # --- Output paths ---
 # Each per-domain training run writes into a sub-directory of `root`
 # named after `domain` (overridable via --output_subdir).
 output:
-  root: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs"
-  checkpoints_dir: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/checkpoints"
-  samples_dir: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/samples"
+  root: "../../../../projects/i2i_diff_aug_dep_v3_sep_over/outputs"
+  checkpoints_dir: "../../../../projects/i2i_diff_aug_dep_v3_sep_over/outputs/checkpoints"
+  samples_dir: "../../../../projects/i2i_diff_aug_dep_v3_sep_over/outputs/samples"
 
 # --- Image settings ---
 image:
@@ -137,15 +142,22 @@ losses:
   aux_max_t_frac: 0.75
 
 # --- Chroma attenuation (post-hoc, non-learned) ---
+# Two symmetric tweaks:
+#   • Dark side (under): sat_floor pushed near zero and depth_chroma_boost
+#     increased so deep tissue reads as near-monochrome. Without this the
+#     residual warm AB on a darkened L renders as brown/gray, not black.
+#   • Bright side (over): highlight_knee lowered from 90 → 78 and
+#     highlight_desat raised from 0.60 → 0.80 so over-bright tissue reads
+#     as blown-out white, not "warm bright". Mirror of the dark fix.
 chroma:
   sat_knee:           5.0
   sat_full:          40.0
-  sat_floor:          0.10
-  depth_chroma_boost: 0.30
-  highlight_desat:    0.60
-  highlight_knee:    90.0
-  purkinje_b_shift:   1.5
-  purkinje_threshold: 20.0
+  sat_floor:          0.05
+  depth_chroma_boost: 0.45
+  highlight_desat:    0.80
+  highlight_knee:    78.0
+  purkinje_b_shift:   2.0
+  purkinje_threshold: 25.0
 
 # --- Texture-gate post-process (recombination) ---
 # Attenuates the original high-frequency texture in regions where the
@@ -171,12 +183,37 @@ content_mask:
 # near the light source. A depth-driven blend weight lets the model fully
 # act only in the deepest regions and falls off to the original L
 # elsewhere. alpha(d) = ((farness - knee) / (1 - knee))^gamma in [floor, 1].
+#
+# gamma was lowered (2.5 → 1.6) and knee → 0 so the dark zone covers the
+# whole depth-far half of the FOV instead of collapsing onto a tight ring
+# around the deepest pixel. Combined with `analytic_floor` below, the
+# darkening reaches L≈0 in the cavity AND extends across a believable area.
 focal_blend:
   enable:       true
-  gamma:        2.5   # higher = more concentrated peak at the deepest pixel
-  knee:         0.05  # dead-zone (no effect) for the bottom 5% of farness
+  gamma:        1.6   # lower = wider effect zone
+  knee:         0.0   # no dead-zone — even the slightly-far tissue darkens
   floor:        0.0   # min α; 0 = fully suppress effect on near tissue
   smooth_sigma: 4.0   # gaussian smoothing of α (px at 512px ref)
+
+# --- Analytic floor (definitive strength clamp on the model output) ---
+# DDPMs trained with MSE/L1 + extreme-weighted L1 still regress toward the
+# conditional mean — the predicted L in the deep cavity ends up around
+# 40–55 instead of the 0–10 the synthetic training targets actually hit.
+# `depth_aware_augment_lab` is the function that produced those targets;
+# we run it at inference with strong parameters and clamp the model's L
+# against it (np.minimum for underexposed, np.maximum for overexposed).
+# The model can only DEEPEN the effect, never weaken it. This is the fix
+# for "looks just grayed instead of dark".
+analytic_floor:
+  enable:                true
+  shift_magnitude_under: 85.0   # max L drop applied in deep cavity
+  shift_magnitude_over:  70.0   # max L lift applied near light source
+  gamma_under:           1.7    # lower = wider underexposure zone
+  gamma_over:            1.5
+  core_threshold:        0.5    # influence above which L is forced toward 0/100
+  core_clip_blend:       0.97   # 1.0 → pure black/white in core; 0.0 → no extra pull
+  hf_kill:               0.97   # fraction of original HF removed at peak influence
+  smooth_sigma_base:     6.0    # gaussian smoothing of depth mask (px at 512px ref)
 
 # --- Inference ---
 inference:

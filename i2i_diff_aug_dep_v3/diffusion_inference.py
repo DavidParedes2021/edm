@@ -48,6 +48,7 @@ from diffusion_train import (
     build_model, EMAModel, load_config, translate_legacy_attn_keys,
 )
 from exposure_augment import lab_to_rgb
+from depth_augment import depth_aware_augment_lab
 from chroma_attenuation import attenuate_chroma, texture_gate, DEFAULT_CFG as CHROMA_DEFAULT_CFG
 from inference_postprocess import (
     detect_content_mask,
@@ -152,14 +153,32 @@ def run_inference(
     # ── focal-blend cfg (suppress effect on non-deep tissue + UI panels) ─
     fb_cfg = cfg.get("focal_blend", {}) or {}
     fb_enable = bool(fb_cfg.get("enable", True))
-    fb_gamma = float(fb_cfg.get("gamma", 2.5))
-    fb_knee = float(fb_cfg.get("knee", 0.05))
+    fb_gamma = float(fb_cfg.get("gamma", 1.6))
+    fb_knee = float(fb_cfg.get("knee", 0.0))
     fb_floor = float(fb_cfg.get("floor", 0.0))
     fb_smooth = float(fb_cfg.get("smooth_sigma", 4.0))
     cm_cfg = cfg.get("content_mask", {}) or {}
     cm_enable = bool(cm_cfg.get("enable", True))
     cm_threshold = float(cm_cfg.get("luma_threshold", 8.0))
     cm_erode = int(cm_cfg.get("erode_iter", 2))
+
+    # ── Analytic-floor cfg ───────────────────────────────────────────────
+    # The DDPM regresses toward the conditional mean and routinely under-
+    # shoots the L-extreme that the synthetic training targets actually
+    # reached. We compute the analytical depth-aware target with strong
+    # parameters and clamp the model's predicted L against it (min for
+    # underexposed, max for overexposed). The diffusion model can only
+    # ever DEEPEN the effect, never weaken it.
+    af_cfg = cfg.get("analytic_floor", {}) or {}
+    af_enable = bool(af_cfg.get("enable", True))
+    af_shift_under = float(af_cfg.get("shift_magnitude_under", 85.0))
+    af_shift_over = float(af_cfg.get("shift_magnitude_over", 70.0))
+    af_gamma_under = float(af_cfg.get("gamma_under", 1.7))
+    af_gamma_over = float(af_cfg.get("gamma_over", 1.5))
+    af_core_threshold = float(af_cfg.get("core_threshold", 0.5))
+    af_core_clip_blend = float(af_cfg.get("core_clip_blend", 0.97))
+    af_hf_kill = float(af_cfg.get("hf_kill", 0.97))
+    af_smooth_sigma_base = float(af_cfg.get("smooth_sigma_base", 6.0))
 
     # ── output root ──────────────────────────────────────────────────────
     out_root = (Path(output_dir) if output_dir
@@ -250,6 +269,34 @@ def run_inference(
                 ),
                 dtype=np.float32,
             )
+
+            # ── Analytic floor: clamp model output to the analytic GT ──
+            # `depth_aware_augment_lab` is the same function that produced
+            # the supervised targets; running it at inference time with
+            # strong parameters gives a guaranteed, depth-correct envelope
+            # the model output cannot weaken.
+            if af_enable:
+                af_shift = (af_shift_under if domain == "underexposed"
+                            else af_shift_over)
+                af_kwargs = dict(
+                    strength=1.0,
+                    shift_magnitude=af_shift,
+                    gamma_over=af_gamma_over,
+                    gamma_under=af_gamma_under,
+                    depth_blend=1.0,
+                    smooth_sigma_base=af_smooth_sigma_base,
+                    core_threshold=af_core_threshold,
+                    core_clip_blend=af_core_clip_blend,
+                    hf_kill=af_hf_kill,
+                )
+                analytic_lab = depth_aware_augment_lab(
+                    rgb_origs[b], d_o, mode=domain, **af_kwargs
+                )
+                L_analytic = analytic_lab[..., 0].astype(np.float32)
+                if domain == "underexposed":
+                    L_pred_full = np.minimum(L_pred_full, L_analytic)
+                else:
+                    L_pred_full = np.maximum(L_pred_full, L_analytic)
 
             # ── Texture reinjection with HF gate ─────────────────────
             sigma = texture_sigma_base * max(H_o, W_o) / 512.0

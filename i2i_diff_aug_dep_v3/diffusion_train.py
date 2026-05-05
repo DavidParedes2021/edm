@@ -20,11 +20,15 @@ Architecture:
 Usage:
     # 0.  precompute depth maps once
     python depth_estimator.py --input_dir ./data/normal --output_dir ./data/depth
+    python depth_estimator.py --input_dir "../../../data/datasets/kvasir_classified/none" --output_dir "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
+
 
     # 1.  generate paired data (over+under in one shot)
     python generate_pairs.py \\
         --normal_dir ./data/normal --depth_dir ./data/depth \\
         --output_dir ./data/pairs --num_variants 3
+
+  python generate_pairs.py --normal_dir "../../../data/datasets/kvasir_classified/none" --depth_dir "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth" --output_dir "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs" --num_variants 1
 
     # 2.  train UNDER and OVER separately
     python diffusion_train.py --config diffusion_config.yaml \\
@@ -63,6 +67,7 @@ from losses import (
     DepthGradientConsistencyLoss,
 )
 from chroma_attenuation import attenuate_chroma, texture_gate
+from depth_augment import depth_aware_augment_lab
 from inference_postprocess import (
     detect_content_mask,
     clean_depth_with_mask,
@@ -280,7 +285,8 @@ def build_model(cfg: dict, device: torch.device):
 def generate_samples(model, scheduler_cfg, inference_cfg, normal_loader,
                      device, epoch, output_dir, image_size,
                      chroma_cfg, domain, tex_gate_cfg, num_samples=4,
-                     focal_blend_cfg=None, content_mask_cfg=None):
+                     focal_blend_cfg=None, content_mask_cfg=None,
+                     analytic_floor_cfg=None):
     """Single-domain DDIM denoising → texture reinjection (with HF gate) →
     focal blend + content-mask passthrough → chroma attenuation → RGB."""
     model.eval()
@@ -299,10 +305,21 @@ def generate_samples(model, scheduler_cfg, inference_cfg, normal_loader,
 
     fb_cfg = focal_blend_cfg or {}
     fb_enable = bool(fb_cfg.get("enable", True))
-    fb_gamma = float(fb_cfg.get("gamma", 2.5))
-    fb_knee = float(fb_cfg.get("knee", 0.05))
+    fb_gamma = float(fb_cfg.get("gamma", 1.6))
+    fb_knee = float(fb_cfg.get("knee", 0.0))
     fb_floor = float(fb_cfg.get("floor", 0.0))
     fb_smooth = float(fb_cfg.get("smooth_sigma", 4.0))
+
+    af_cfg = analytic_floor_cfg or {}
+    af_enable = bool(af_cfg.get("enable", True))
+    af_shift_under = float(af_cfg.get("shift_magnitude_under", 85.0))
+    af_shift_over = float(af_cfg.get("shift_magnitude_over", 70.0))
+    af_gamma_under = float(af_cfg.get("gamma_under", 1.7))
+    af_gamma_over = float(af_cfg.get("gamma_over", 1.5))
+    af_core_threshold = float(af_cfg.get("core_threshold", 0.5))
+    af_core_clip_blend = float(af_cfg.get("core_clip_blend", 0.97))
+    af_hf_kill = float(af_cfg.get("hf_kill", 0.97))
+    af_smooth_sigma_base = float(af_cfg.get("smooth_sigma_base", 6.0))
 
     cm_cfg = content_mask_cfg or {}
     cm_enable = bool(cm_cfg.get("enable", True))
@@ -318,6 +335,7 @@ def generate_samples(model, scheduler_cfg, inference_cfg, normal_loader,
         B = source_L.shape[0]
 
         # Per-sample content mask + cleaned depth (full resolution)
+        rgb_origs = []
         masks_full = []
         depths_clean_full = []
         for b in range(B):
@@ -335,6 +353,7 @@ def generate_samples(model, scheduler_cfg, inference_cfg, normal_loader,
             else:
                 m = np.ones((H_o, W_o), dtype=bool)
             d_clean = clean_depth_with_mask(d_o, m, border_value=border_d)
+            rgb_origs.append(rgb_orig)
             masks_full.append(m)
             depths_clean_full.append(d_clean)
 
@@ -376,6 +395,29 @@ def generate_samples(model, scheduler_cfg, inference_cfg, normal_loader,
                     (W_o, H_o), Image.LANCZOS
                 ), dtype=np.float32,
             )
+
+            # Analytic floor — clamp model output to the analytic GT
+            if af_enable:
+                af_shift = (af_shift_under if domain == "underexposed"
+                            else af_shift_over)
+                analytic_lab = depth_aware_augment_lab(
+                    rgb_origs[b], d_full, mode=domain,
+                    strength=1.0,
+                    shift_magnitude=af_shift,
+                    gamma_over=af_gamma_over,
+                    gamma_under=af_gamma_under,
+                    depth_blend=1.0,
+                    smooth_sigma_base=af_smooth_sigma_base,
+                    core_threshold=af_core_threshold,
+                    core_clip_blend=af_core_clip_blend,
+                    hf_kill=af_hf_kill,
+                )
+                L_analytic = analytic_lab[..., 0].astype(np.float32)
+                if domain == "underexposed":
+                    L_pred_full = np.minimum(L_pred_full, L_analytic)
+                else:
+                    L_pred_full = np.maximum(L_pred_full, L_analytic)
+
             sigma = 3.0 * max(H_o, W_o) / 512.0
             L_high = l_o - gaussian_filter(l_o, sigma=sigma)
             L_low_pred = gaussian_filter(L_pred_full, sigma=sigma)
@@ -728,6 +770,7 @@ def train(cfg: dict, resume_path: str = None,
                 num_samples=4,
                 focal_blend_cfg=cfg.get("focal_blend", {}),
                 content_mask_cfg=cfg.get("content_mask", {}),
+                analytic_floor_cfg=cfg.get("analytic_floor", {}),
             )
             model.load_state_dict(orig_sd)
             print(f"  → samples saved to {samp_dir}")
