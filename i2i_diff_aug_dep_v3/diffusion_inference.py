@@ -45,7 +45,7 @@ from PIL import Image
 
 from diffusion_dataset import NormalInferenceDataset
 from diffusion_train import (
-    build_model, EMAModel, load_config, translate_legacy_attn_keys,
+    build_model, EMAModel, load_config, align_attn_keys_to_model,
 )
 from exposure_augment import lab_to_rgb
 from depth_augment import depth_aware_augment_lab
@@ -73,11 +73,6 @@ def run_inference(
     # checkpoints are domain-specialised, so the safest source of truth is
     # the checkpoint itself.
     ckpt = torch.load(checkpoint_path, map_location="cpu")
-    # Migrate legacy diffusers attention key names (pre-0.18 -> modern).
-    if "model" in ckpt:
-        ckpt["model"] = translate_legacy_attn_keys(ckpt["model"])
-    if "ema" in ckpt:
-        ckpt["ema"] = translate_legacy_attn_keys(ckpt["ema"])
 
     # Resolve domain — priority: CLI arg > checkpoint's saved config > config file.
     cli_domain = (domain or "").strip().lower() or None
@@ -103,6 +98,12 @@ def run_inference(
 
     # ── model ────────────────────────────────────────────────────────────
     model = build_model(cfg, device)
+    # Reconcile diffusers attention key names against whatever convention the
+    # locally-installed `diffusers` produced for this freshly-built UNet.
+    if "model" in ckpt:
+        ckpt["model"] = align_attn_keys_to_model(ckpt["model"], model)
+    if "ema" in ckpt:
+        ckpt["ema"] = align_attn_keys_to_model(ckpt["ema"], model)
     if "ema" in ckpt:
         ema = EMAModel(model)
         ema.load_state_dict(ckpt["ema"])

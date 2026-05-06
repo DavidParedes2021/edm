@@ -33,12 +33,12 @@ Usage:
     # 2.  train UNDER and OVER separately
     python diffusion_train.py --config diffusion_config.yaml \\
         --domain underexposed --output_subdir under
-    python diffusion_train.py --config diffusion_config.yaml \\
-        --domain overexposed  --output_subdir over
+    python diffusion_train.py --config diffusion_config.yaml --domain overexposed  --output_subdir over
 
     # 3.  generate
-    python diffusion_inference.py --config diffusion_config.yaml \\
-        --checkpoint .../checkpoints/under/best.pt --domain underexposed
+    python diffusion_inference.py --config diffusion_config.yaml --checkpoint .../checkpoints/under/best.pt --domain underexposed
+    python diffusion_inference.py --config diffusion_config.yaml --checkpoint ../../../../projects/i2i_diff_aug_dep_v3_sep_over/outputs/checkpoints/best.pt --domain overexposed --output_dir ../../../../projects/i2i_diff_aug_dep_v3_sep_over/outputs/inverence_over
+
 """
 
 import argparse
@@ -125,28 +125,75 @@ _LEGACY_ATTN_RENAMES = (
     (".proj_attn.bias",   ".to_out.0.bias"),
 )
 
+_MODERN_ATTN_RENAMES = tuple((new, old) for old, new in _LEGACY_ATTN_RENAMES)
 
-def translate_legacy_attn_keys(state_dict: dict) -> dict:
-    """Return a copy of `state_dict` with legacy attention key names rewritten.
 
-    Only keys containing `.attentions.` are touched; everything else passes
-    through verbatim. Safe to call on already-modern state dicts (no-op).
-    """
+def _rename_attn_keys(state_dict: dict, renames, label: str) -> dict:
     out = {}
     renamed = 0
     for k, v in state_dict.items():
         new_k = k
         if ".attentions." in k:
-            for old, new in _LEGACY_ATTN_RENAMES:
+            for old, new in renames:
                 if new_k.endswith(old):
                     new_k = new_k[: -len(old)] + new
                     renamed += 1
                     break
         out[new_k] = v
     if renamed:
-        print(f"[ckpt] translated {renamed} legacy diffusers attention keys "
-              f"(query/key/value/proj_attn -> to_q/to_k/to_v/to_out.0)")
+        print(f"[ckpt] translated {renamed} {label} diffusers attention keys")
     return out
+
+
+def translate_legacy_attn_keys(state_dict: dict) -> dict:
+    """Rename legacy attention keys to the modern diffusers convention.
+
+    Only keys containing `.attentions.` are touched; everything else passes
+    through verbatim. Safe to call on already-modern state dicts (no-op).
+    """
+    return _rename_attn_keys(
+        state_dict, _LEGACY_ATTN_RENAMES,
+        "legacy (query/key/value/proj_attn -> to_q/to_k/to_v/to_out.0)",
+    )
+
+
+def translate_modern_attn_keys(state_dict: dict) -> dict:
+    """Inverse of `translate_legacy_attn_keys` — used when the installed
+    `diffusers` version still uses the legacy names (pre-0.18).
+    """
+    return _rename_attn_keys(
+        state_dict, _MODERN_ATTN_RENAMES,
+        "modern (to_q/to_k/to_v/to_out.0 -> query/key/value/proj_attn)",
+    )
+
+
+def _attn_key_style(keys) -> str:
+    """Return 'modern', 'legacy', or 'unknown' for a collection of state-dict keys."""
+    has_modern = any(
+        k.endswith(".to_q.weight") or k.endswith(".to_out.0.weight") for k in keys
+    )
+    has_legacy = any(
+        k.endswith(".query.weight") or k.endswith(".proj_attn.weight") for k in keys
+    )
+    if has_modern and not has_legacy:
+        return "modern"
+    if has_legacy and not has_modern:
+        return "legacy"
+    return "unknown"
+
+
+def align_attn_keys_to_model(state_dict: dict, model) -> dict:
+    """Rename attention keys in `state_dict` to match the convention used by
+    the freshly-built `model`. Handles both directions so the same checkpoint
+    loads on hosts with either old or new `diffusers` installed.
+    """
+    model_style = _attn_key_style(model.state_dict().keys())
+    sd_style = _attn_key_style(state_dict.keys())
+    if model_style == "modern" and sd_style == "legacy":
+        return translate_legacy_attn_keys(state_dict)
+    if model_style == "legacy" and sd_style == "modern":
+        return translate_modern_attn_keys(state_dict)
+    return state_dict
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -558,10 +605,11 @@ def train(cfg: dict, resume_path: str = None,
     best_loss = float("inf")
     if resume_path and os.path.isfile(resume_path):
         ck = torch.load(resume_path, map_location="cpu")
-        # Migrate legacy diffusers attention key names if present.
-        ck["model"] = translate_legacy_attn_keys(ck["model"])
+        # Reconcile diffusers attention key names with whatever convention
+        # the freshly-built model uses on this host.
+        ck["model"] = align_attn_keys_to_model(ck["model"], model)
         if "ema" in ck:
-            ck["ema"] = translate_legacy_attn_keys(ck["ema"])
+            ck["ema"] = align_attn_keys_to_model(ck["ema"], model)
         try:
             model.load_state_dict(ck["model"])
         except RuntimeError:
