@@ -38,7 +38,7 @@
 # CLI override: pass `--domain overexposed` or
 # `--domain underexposed` to either diffusion_train.py or
 # diffusion_inference.py to override this field for one run.
-domain: "overexposed"
+domain: "underexposed"
 
 # --- Data paths ---
 data:
@@ -50,19 +50,19 @@ data:
   #normal_dir: "../../../data/datasets/kvasir_classified/none"
   #depth_dir:  "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
   
-  pairs_dir: "../../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs"
-  #normal_dir: "../../../../data/datasets/kvasir_classified/none_filtered"
+  pairs_dir: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs"
+  normal_dir: "../../../data/datasets/kvasir_classified/none_filtered"
 
-  normal_dir: "../../../../data/datasets/kvasir_classified/none"
-  depth_dir:  "../../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
+  #normal_dir: "../../../../data/datasets/kvasir_classified/none"
+  depth_dir:  "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
 
 # --- Output paths ---
 # Each per-domain training run writes into a sub-directory of `root`
 # named after `domain` (overridable via --output_subdir).
 output:
-  root: "../../../../projects/i2i_diff_aug_dep_v3_sep_over/outputs"
-  checkpoints_dir: "../../../../projects/i2i_diff_aug_dep_v3_sep_over/outputs/checkpoints"
-  samples_dir: "../../../../projects/i2i_diff_aug_dep_v3_sep_over/outputs/samples"
+  root: "/../../projects/i2i_diff_aug_dep_v3_sep_v2/outputs"
+  checkpoints_dir: "../../../projects/i2i_diff_aug_dep_v3_sep_v2/outputs/checkpoints"
+  samples_dir: "../../../projects/i2i_diff_aug_dep_v3_sep_v2/outputs/samples"
 
 # --- Image settings ---
 image:
@@ -123,15 +123,22 @@ training:
 # --- Losses ---
 losses:
   mse_weight: 1.0
-  l1_weight: 0.1
-  edge_weight: 0.03
+  l1_weight: 0.5            # was 0.1 — direct x0 supervision now matters
+  edge_weight: 0.05         # was 0.03
+
+  # Min-SNR-γ MSE weighting (Hang et al. 2023). Without this, ε-prediction
+  # MSE at low-t (high SNR) collapses in equivalent x0-loss weight, so the
+  # model has no incentive to commit to the extreme dark/bright targets in
+  # the supervision and instead regresses toward source. γ=5 is the value
+  # the paper tunes to and is robust across tasks. Set to 1e6 to disable.
+  min_snr_gamma: 5.0
 
   # Extreme-weighted L1 — single knob; the loss automatically uses
   # mode='dark' if domain='underexposed', mode='bright' if 'overexposed'.
   # Heavily upweights pixels at the target's extreme to crush the
   # mean-regression bias responsible for "barely noticeable" effects.
-  extreme_weight: 0.50      # was dark_weight=0.15
-  extreme_alpha:  5.0       # was 3.0
+  extreme_weight: 2.0       # was 0.5 — dominant now that min-SNR opened low-t
+  extreme_alpha:  5.0
   extreme_tau:    0.3
 
   # Depth-gradient consistency — keeps exposure falloff aligned with geometry.

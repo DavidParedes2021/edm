@@ -643,6 +643,12 @@ def train(cfg: dict, resume_path: str = None,
         "aux_max_t_frac", 0.5
     ) * cfg["diffusion"]["num_train_timesteps"])
 
+    # Min-SNR-γ MSE weighting (Hang et al., 2023). Without this the model
+    # regresses to the conditional mean and outputs a slightly-dimmed source
+    # — which is exactly what the raw inference outputs were doing. Set γ to
+    # a large value (e.g. 1e6) to disable for a legacy comparison run.
+    min_snr_gamma = float(cfg["losses"].get("min_snr_gamma", 5.0))
+
     # Pre-cached cumulative-alpha tensor (fp32, on device) for the x0 math
     alphas_cumprod_fp32 = noise_scheduler.alphas_cumprod.to(
         device=device, dtype=torch.float32
@@ -678,8 +684,20 @@ def train(cfg: dict, resume_path: str = None,
             with autocast(enabled=cfg["training"]["mixed_precision"]):
                 pred_noise = model(model_input, timesteps,
                                    class_labels=None).sample
-                loss_mse = F.mse_loss(pred_noise, noise)
-                total = mse_w * loss_mse
+
+            # Min-SNR-γ weighted MSE in fp32 (outside autocast).
+            # SNR(t) = ᾱ(t) / (1 - ᾱ(t)). Uniform per-t MSE on ε is equivalent
+            # to a SNR(t)-weighted MSE on x0 — collapsing the gradient signal
+            # at low-t (high SNR), the regime where the model must commit to
+            # extreme dark/bright targets. Capping the effective x0 weight at
+            # γ rebalances the per-timestep contribution.
+            with torch.no_grad():
+                a_bar_t = alphas_cumprod_fp32[timesteps].clamp(1e-4, 1.0 - 1e-7)
+                snr = a_bar_t / (1.0 - a_bar_t)
+                w_t = (snr.clamp(max=min_snr_gamma) / snr).view(-1, 1, 1, 1)
+            mse_per = (pred_noise.float() - noise.float()).pow(2)
+            loss_mse = (w_t * mse_per).mean()
+            total = mse_w * loss_mse
 
             # ── x0-estimate path (fp32, OUTSIDE autocast) ──────────────────
             # This is the previous NaN source: at high t, alpha_cumprod -> 0,
@@ -738,9 +756,13 @@ def train(cfg: dict, resume_path: str = None,
                     aux_total = aux_total + dg_w * l_dg
                     parts_this_step["dg"] = float(l_dg.detach())
 
-                # Scale aux by fraction of batch that passed the gate so its
-                # contribution is stable as the SNR-gate selectivity varies.
-                total = total + aux_total * (n_aux / B)
+                # Don't dilute by selectivity. The aux losses are already
+                # gated to a useful timestep range; further down-scaling by
+                # `n_aux/B` made the extreme-weighted L1 invisible against
+                # MSE and was a contributor to the regression-to-mean
+                # behaviour (the model effectively saw aux losses worth
+                # ~0.4× MSE instead of the configured ~0.7×).
+                total = total + aux_total
 
             loss = total / grad_accum
 
