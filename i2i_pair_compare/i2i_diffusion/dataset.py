@@ -52,8 +52,8 @@ class PairDataset(Dataset):
         root = Path(pairs_root)
         self.normal_dir = root / "normal"
         self.depth_dir = root / "depth"
-        self.over_dir = root / "over"
-        self.under_dir = root / "under"
+        self.over_dir = root / "overexposed"
+        self.under_dir = root / "underexposed"
         for d in (self.normal_dir, self.depth_dir, self.over_dir, self.under_dir):
             if not d.is_dir():
                 raise FileNotFoundError(f"Missing directory: {d}")
