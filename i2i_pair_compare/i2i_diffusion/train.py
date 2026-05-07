@@ -20,9 +20,9 @@ import yaml
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from i2i_diffusion.dataset import PairDataset
-from i2i_diffusion.scheduler import DDPMScheduler, ddim_sample
-from i2i_diffusion.unet import UNet
+from dataset import PairDataset
+from scheduler import DDPMScheduler, ddim_sample
+from unet import UNet
 
 
 # ─────────────────────────────────────────────────────────────────────────────

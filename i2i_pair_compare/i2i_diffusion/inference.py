@@ -30,9 +30,9 @@ import torch
 import yaml
 from PIL import Image
 
-from i2i_diffusion.postprocess import lab_to_rgb, recombine_L_with_chroma, rgb_to_lab
-from i2i_diffusion.scheduler import DDPMScheduler, ddim_sample, ddpm_sample
-from i2i_diffusion.unet import UNet
+from postprocess import lab_to_rgb, recombine_L_with_chroma, rgb_to_lab
+from scheduler import DDPMScheduler, ddim_sample, ddpm_sample
+from unet import UNet
 
 
 _MODE_TO_LABEL = {"over": 0, "under": 1, "overexposed": 0, "underexposed": 1}
