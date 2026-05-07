@@ -264,7 +264,7 @@ def main() -> None:
         weight_decay=cfg["training"]["weight_decay"],
     )
     use_amp = bool(cfg["training"]["amp"]) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     # ── Resume ────────────────────────────────────────────────────────────
     start_step = 0
@@ -317,7 +317,7 @@ def main() -> None:
             pg["lr"] = lr_now
 
         optim.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=use_amp):
+        with torch.cuda.amp.autocast(enabled=use_amp):
             eps_pred = model(x_in, t, y)
             loss = F.mse_loss(eps_pred, noise)
 
