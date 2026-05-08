@@ -9,6 +9,7 @@ data:
   val_batch_size: 8
   val_max_batches: 0    # 0 = use entire val set; set >0 to cap for speed
   val_t_grid: [50, 250, 500, 750, 950]   # fixed timesteps used during validation
+  target_type: L          # 'L' = predict L_target (current); 'delta' = predict L_target - L_normal (stronger shifts; requires retrain)
 
 model:
   base_channels: 64
@@ -38,6 +39,7 @@ training:
   val_every: 5000
   out_dir: "../../../../../projects/i2i_diff_pair_compare/outputs"
   resume: null
+  reset_ema_on_resume: false   # set true to wipe EMA shadow and restart warmup on resume
 
 inference:
   ckpt: "../../../../../projects/i2i_diff_pair_compare/outputs/best.pt"

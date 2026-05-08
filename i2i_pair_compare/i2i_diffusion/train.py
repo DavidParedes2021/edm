@@ -35,23 +35,40 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 class EMA:
-    """Exponential moving average of model parameters."""
+    """Exponential moving average of model parameters with step-dependent warmup.
+
+    Effective decay at step t:  min(target_decay, (1 + t) / (10 + t)).
+    This avoids the cold-start problem where the EMA shadow is dominated by the
+    (zero-initialised output conv → mostly random) initial weights for tens of
+    thousands of steps, producing noise-only samples in early training.
+    """
 
     def __init__(self, model: torch.nn.Module, decay: float) -> None:
-        self.decay = decay
+        self.target_decay = float(decay)
+        self.step = 0
         self.shadow = copy.deepcopy(model)
         for p in self.shadow.parameters():
             p.requires_grad_(False)
 
+    def current_decay(self) -> float:
+        return min(self.target_decay, (1.0 + self.step) / (10.0 + self.step))
+
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
+        self.step += 1
+        decay = self.current_decay()
         msd = model.state_dict()
         ssd = self.shadow.state_dict()
         for k in ssd.keys():
             if ssd[k].dtype.is_floating_point:
-                ssd[k].mul_(self.decay).add_(msd[k].detach(), alpha=1.0 - self.decay)
+                ssd[k].mul_(decay).add_(msd[k].detach(), alpha=1.0 - decay)
             else:
                 ssd[k].copy_(msd[k])
+
+    def reset_to(self, model: torch.nn.Module) -> None:
+        """Hard-reset shadow to current model and restart warmup."""
+        self.shadow.load_state_dict(model.state_dict())
+        self.step = 0
 
 
 def lr_lambda(step: int, warmup: int, total: int) -> float:
@@ -111,43 +128,64 @@ def validate(
 
 
 def save_preview(
-    model: torch.nn.Module,
+    models: Dict[str, torch.nn.Module],
     scheduler: DDPMScheduler,
     batch: Dict[str, torch.Tensor],
     out_path: Path,
     device: torch.device,
     num_steps: int = 50,
+    target_type: str = "L",
 ) -> None:
-    """Sample for a single fixed batch and dump a side-by-side preview PNG."""
-    model.eval()
+    """Sample for a single fixed batch and dump a side-by-side preview PNG.
+
+    `models` is a dict like {"ema": ema.shadow, "live": model}; one column per
+    entry is rendered. When `target_type="delta"`, the target and predictions
+    are converted back to the L-normalised space (cond + delta) so the panels
+    show actual exposure rather than near-zero deltas.
+    """
     cond_L = batch["cond_L"].to(device)
     depth = batch["depth"].to(device)
-    target_L = batch["target_L"].to(device)
+    target = batch["target_L"].to(device)
     y = batch["mode"].to(device)
 
     cond = torch.cat([cond_L, depth], dim=1)
-    pred = ddim_sample(
-        model,
-        scheduler,
-        cond=cond,
-        y=y,
-        shape=target_L.shape,
-        device=device,
-        num_steps=num_steps,
-        guidance_scale=1.0,
-    )
-    pred = torch.clamp(pred, -1.0, 1.0)
-    model.train()
+    preds: Dict[str, torch.Tensor] = {}
+    for name, m in models.items():
+        was_training = m.training
+        m.eval()
+        pred = ddim_sample(
+            m,
+            scheduler,
+            cond=cond,
+            y=y,
+            shape=target.shape,
+            device=device,
+            num_steps=num_steps,
+            guidance_scale=1.0,
+        )
+        preds[name] = torch.clamp(pred, -1.0, 1.0)
+        if was_training:
+            m.train()
+
+    # Convert target/pred to display-L (normalised [-1, 1]) when in delta mode.
+    if target_type == "delta":
+        target_disp = torch.clamp(cond_L + target, -1.0, 1.0)
+        preds_disp = {k: torch.clamp(cond_L + v, -1.0, 1.0) for k, v in preds.items()}
+    else:
+        target_disp = target
+        preds_disp = preds
 
     def to_uint8(t: torch.Tensor) -> np.ndarray:
-        # (B, 1, H, W) in [-1, 1] → (B*H, W) uint8
         a = ((t.detach().cpu().float() + 1.0) * 127.5).clamp(0, 255).numpy().astype(np.uint8)
-        return a[:, 0]  # (B, H, W)
+        return a[:, 0]
 
     cond_u = to_uint8(cond_L)
-    target_u = to_uint8(target_L)
-    pred_u = to_uint8(pred)
-    rows = [np.concatenate([cond_u[i], target_u[i], pred_u[i]], axis=1) for i in range(cond_u.shape[0])]
+    target_u = to_uint8(target_disp)
+    pred_u = {k: to_uint8(v) for k, v in preds_disp.items()}
+    rows = []
+    for i in range(cond_u.shape[0]):
+        cols = [cond_u[i], target_u[i]] + [pred_u[k][i] for k in preds_disp.keys()]
+        rows.append(np.concatenate(cols, axis=1))
     grid = np.concatenate(rows, axis=0)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(grid, mode="L").save(out_path)
@@ -174,7 +212,9 @@ def main() -> None:
     # ── Data ──────────────────────────────────────────────────────────────
     val_fraction = float(cfg["data"].get("val_fraction", 0.0))
     split_seed = int(cfg["data"].get("split_seed", 1234))
+    target_type = str(cfg["data"].get("target_type", "L"))
     use_val = val_fraction > 0.0
+    print(f"[i2i] target_type={target_type}")
 
     train_dataset = PairDataset(
         pairs_root=cfg["data"]["pairs_root"],
@@ -184,6 +224,7 @@ def main() -> None:
         val_fraction=val_fraction,
         split_seed=split_seed,
         augment=True,
+        target_type=target_type,
     )
     val_dataset = (
         PairDataset(
@@ -194,6 +235,7 @@ def main() -> None:
             val_fraction=val_fraction,
             split_seed=split_seed,
             augment=False,
+            target_type=target_type,
         )
         if use_val
         else None
@@ -277,7 +319,18 @@ def main() -> None:
         optim.load_state_dict(ck["optim"])
         start_step = int(ck.get("step", 0))
         best_loss = float(ck.get("best_loss", float("inf")))
-        print(f"[i2i] resumed from {resume} @ step {start_step} (best={best_loss:.4f})")
+        # Restore EMA step so warmup decay continues from where we left off.
+        # Old checkpoints (no "ema_step") fall back to the global step — this
+        # also means resuming a cold-EMA run gets a sane decay immediately.
+        ema.step = int(ck.get("ema_step", start_step))
+        if cfg["training"].get("reset_ema_on_resume", False):
+            ema.reset_to(model)
+            print(f"[i2i] EMA shadow reset to current model (warmup restarted)")
+        print(
+            f"[i2i] resumed from {resume} @ step {start_step} "
+            f"(best={best_loss:.4f}, ema_step={ema.step}, "
+            f"ema_decay_now={ema.current_decay():.5f})"
+        )
 
     # ── Train loop ────────────────────────────────────────────────────────
     total_steps = cfg["training"]["total_steps"]
@@ -352,12 +405,16 @@ def main() -> None:
             )
 
         if (step + 1) % sample_every == 0 or (step + 1) == total_steps:
+            # Side-by-side: cond | target | EMA pred | live pred
+            # The "live" column reflects what the model has actually learned;
+            # the "ema" column lags during warmup but is the inference target.
             save_preview(
-                ema.shadow,
+                {"ema": ema.shadow, "live": model},
                 scheduler,
                 preview_batch,
                 out_path=out_dir / "samples" / f"step_{step+1:07d}.png",
                 device=device,
+                target_type=target_type,
             )
 
         # ── Validation + best.pt gating ───────────────────────────────────
@@ -382,6 +439,7 @@ def main() -> None:
                     "step": step + 1,
                     "model": model.state_dict(),
                     "ema": ema.shadow.state_dict(),
+                    "ema_step": ema.step,
                     "optim": optim.state_dict(),
                     "config": cfg,
                     "best_loss": best_loss,

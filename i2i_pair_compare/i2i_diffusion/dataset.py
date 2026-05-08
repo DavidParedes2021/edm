@@ -46,9 +46,12 @@ class PairDataset(Dataset):
         val_fraction: float = 0.0,
         split_seed: int = 1234,
         augment: bool = True,        # disable for validation: center crop, no flip, deterministic mode
+        target_type: str = "L",      # "L": target = L_target. "delta": target = L_target - L_normal.
     ) -> None:
         if split not in ("all", "train", "val"):
             raise ValueError(f"split must be 'all'/'train'/'val', got {split}")
+        if target_type not in ("L", "delta"):
+            raise ValueError(f"target_type must be 'L' or 'delta', got {target_type}")
         root = Path(pairs_root)
         self.normal_dir = root / "normal"
         self.depth_dir = root / "depth"
@@ -98,6 +101,7 @@ class PairDataset(Dataset):
         self.flip_prob = float(flip_prob) if augment else 0.0
         self.augment = bool(augment)
         self.split = split
+        self.target_type = target_type
 
     def __len__(self) -> int:
         return len(self.items)
@@ -152,7 +156,12 @@ class PairDataset(Dataset):
 
         L_normal_n = (L_normal / 50.0 - 1.0).astype(np.float32)
         depth_n = (depth_c * 2.0 - 1.0).astype(np.float32)
-        target_n = (target_L / 50.0 - 1.0).astype(np.float32)
+        if self.target_type == "delta":
+            # delta = L_target − L_normal ∈ [-100, 100]. /50 keeps typical
+            # magnitudes near unity; extreme crush/saturation maps to ±2.
+            target_n = ((target_L - L_normal) / 50.0).astype(np.float32)
+        else:
+            target_n = (target_L / 50.0 - 1.0).astype(np.float32)
 
         return {
             "cond_L": torch.from_numpy(L_normal_n).unsqueeze(0),

@@ -100,10 +100,18 @@ def predict_L(
     guidance_scale: float = 1.0,
     seed: int | None = None,
     save_raw_prefix: Optional[Path] = None,
+    residual_amplify: float = 1.0,
 ) -> np.ndarray:
-    """Run the diffusion model and return predicted L at full resolution."""
+    """Run the diffusion model and return predicted L at full resolution.
+
+    `residual_amplify` multiplies the predicted L-shift before recombining
+    with the original full-res cond. >1 makes under/over stronger.
+    `cfg['data']['target_type']` may be "L" (default; model predicts L_target)
+    or "delta" (model predicts L_target − L_normal directly).
+    """
     H, W = L_normal_full.shape
     res = int(cfg["data"]["resolution"])
+    target_type = str(cfg.get("data", {}).get("target_type", "L"))
 
     L_normal_low = _resize_2d(L_normal_full, (res, res), mode="bilinear")
     depth_low = _resize_2d(depth_full, (res, res), mode="bilinear")
@@ -139,14 +147,21 @@ def predict_L(
             guidance_scale=guidance_scale,
         )
     x = torch.clamp(x, -1.0, 1.0).cpu().numpy()[0, 0]
-    L_pred_low = (x + 1.0) * 50.0  # back to [0, 100]
+
+    # ── Recover L at training resolution depending on what the model predicts ─
+    # target_type=="L":     model output ∈ [-1,1] is L_target/50 - 1
+    # target_type=="delta": model output ∈ [-1,1] is (L_target - L_normal)/50
+    if target_type == "delta":
+        delta_low = (x * 50.0).astype(np.float32)
+        L_pred_low = np.clip(L_normal_low + delta_low, 0.0, 100.0).astype(np.float32)
+    else:
+        L_pred_low = ((x + 1.0) * 50.0).astype(np.float32)
+        delta_low = (L_pred_low - L_normal_low).astype(np.float32)
 
     # ── Optional: dump exactly what the model saw and produced ────────────
-    # Saves four sibling files next to the main output so you can inspect
-    # what the diffusion network learned, with no residual or chroma fix-up.
     if save_raw_prefix is not None:
         prefix = Path(save_raw_prefix)
-        L_pred_clipped = np.clip(L_pred_low.astype(np.float32), 0.0, 100.0)
+        L_pred_clipped = np.clip(L_pred_low, 0.0, 100.0)
         L_cond_clipped = np.clip(L_normal_low.astype(np.float32), 0.0, 100.0)
         _save_L_as_gray(L_pred_clipped, prefix.with_name(prefix.stem + "_raw_pred.png"))
         _save_L_as_gray(L_cond_clipped, prefix.with_name(prefix.stem + "_raw_cond.png"))
@@ -154,12 +169,16 @@ def predict_L(
         np.save(prefix.with_name(prefix.stem + "_raw_cond.npy"), L_cond_clipped)
         print(f"[i2i] saved raw pred/cond at {res}x{res} next to {prefix.name}")
 
+    # ── Compose full-resolution output ────────────────────────────────────
     if use_residual:
-        residual_low = (L_pred_low - L_normal_low).astype(np.float32)
-        residual_full = _resize_2d(residual_low, (H, W), mode="bilinear")
-        L_pred_full = np.clip(L_normal_full + residual_full, 0.0, 100.0)
+        delta_low_amp = (delta_low * float(residual_amplify)).astype(np.float32)
+        delta_full = _resize_2d(delta_low_amp, (H, W), mode="bilinear")
+        L_pred_full = np.clip(L_normal_full + delta_full, 0.0, 100.0)
     else:
         L_pred_full = _resize_2d(L_pred_low, (H, W), mode="bilinear")
+        if float(residual_amplify) != 1.0:
+            deviation = L_pred_full - L_normal_full
+            L_pred_full = L_normal_full + float(residual_amplify) * deviation
         L_pred_full = np.clip(L_pred_full, 0.0, 100.0)
 
     return L_pred_full.astype(np.float32)
@@ -177,6 +196,7 @@ def run(
     guidance_scale: float = 1.0,
     save_L_npy: bool = False,
     save_raw: bool = False,
+    residual_amplify: float = 1.0,
     seed: int | None = None,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -202,6 +222,7 @@ def run(
         guidance_scale=guidance_scale,
         seed=seed,
         save_raw_prefix=out_path if save_raw else None,
+        residual_amplify=residual_amplify,
     )
 
     rgb_out = recombine_L_with_chroma(L_pred_full, A, B)
@@ -230,6 +251,10 @@ def main() -> None:
     parser.add_argument("--save_raw", action="store_true",
                         help="Also dump model's raw L pred and the input cond L at "
                              "training resolution (PNG + .npy, no residual / no chroma).")
+    parser.add_argument("--residual_amplify", type=float, default=1.0,
+                        help="Multiply the predicted L-shift by this factor before "
+                             "recombining with the full-res cond. >1 = stronger "
+                             "under/over (try 1.5, 2.0, 3.0).")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
@@ -245,6 +270,7 @@ def main() -> None:
         guidance_scale=args.guidance_scale,
         save_L_npy=args.save_L_npy,
         save_raw=args.save_raw,
+        residual_amplify=args.residual_amplify,
         seed=args.seed,
     )
 
