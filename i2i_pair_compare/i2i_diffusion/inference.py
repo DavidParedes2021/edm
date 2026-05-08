@@ -54,6 +54,50 @@ def _save_L_as_gray(L: np.ndarray, path: Path) -> None:
     Image.fromarray(arr, mode="L").save(path)
 
 
+def _save_unit_as_gray(arr01: np.ndarray, path: Path) -> None:
+    """Save a [0, 1] float array as an 8-bit grayscale PNG."""
+    a = np.clip(arr01.astype(np.float32) * 255.0, 0.0, 255.0).astype(np.uint8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(a, mode="L").save(path)
+
+
+def _build_depth_mask(
+    depth: np.ndarray,
+    mode: str,
+    gamma_over: float = 1.5,
+    gamma_under: float = 2.0,
+    smooth_sigma_base: float = 6.0,
+) -> np.ndarray:
+    """Reproduce the rule-based depth mask from `code _to_generate_pairs/depth_augment.py`.
+
+    For 'over' the mask peaks on the *nearest* pixels (depth=1), for 'under' on
+    the *farthest* pixels (depth=0). Smoothed and renormalised to [0, 1].
+    Smoothing sigma scales with image size relative to the original 512 px ref.
+    """
+    try:
+        from scipy.ndimage import gaussian_filter
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "scipy is required for the depth-mask visualisation; install with "
+            "`pip install scipy`. (Already a dependency of the dataset generator.)"
+        ) from e
+    H, W = depth.shape
+    scale = max(H, W) / 512.0
+    sigma = smooth_sigma_base * scale
+    if mode in ("over", "overexposed"):
+        gamma = gamma_over
+        m = np.power(np.clip(depth, 0.0, 1.0), gamma)
+    else:
+        gamma = gamma_under
+        m = np.power(np.clip(1.0 - depth, 0.0, 1.0), gamma)
+    if sigma > 0:
+        m = gaussian_filter(m.astype(np.float32), sigma=sigma)
+    mx = float(m.max())
+    if mx > 1e-6:
+        m = m / mx
+    return np.clip(m, 0.0, 1.0).astype(np.float32)
+
+
 def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, dict]:
     ck = torch.load(ckpt_path, map_location=device)
     cfg = ck.get("config")
@@ -163,11 +207,21 @@ def predict_L(
         prefix = Path(save_raw_prefix)
         L_pred_clipped = np.clip(L_pred_low, 0.0, 100.0)
         L_cond_clipped = np.clip(L_normal_low.astype(np.float32), 0.0, 100.0)
+        depth_clipped = np.clip(depth_low.astype(np.float32), 0.0, 1.0)
         _save_L_as_gray(L_pred_clipped, prefix.with_name(prefix.stem + "_raw_pred.png"))
         _save_L_as_gray(L_cond_clipped, prefix.with_name(prefix.stem + "_raw_cond.png"))
+        _save_unit_as_gray(depth_clipped, prefix.with_name(prefix.stem + "_raw_depth.png"))
         np.save(prefix.with_name(prefix.stem + "_raw_pred.npy"), L_pred_clipped)
         np.save(prefix.with_name(prefix.stem + "_raw_cond.npy"), L_cond_clipped)
-        print(f"[i2i] saved raw pred/cond at {res}x{res} next to {prefix.name}")
+        np.save(prefix.with_name(prefix.stem + "_raw_depth.npy"), depth_clipped)
+        # Rule-based depth mask the original augmenter used to make the target.
+        try:
+            mask = _build_depth_mask(depth_clipped, mode=mode)
+            _save_unit_as_gray(mask, prefix.with_name(prefix.stem + "_raw_mask.png"))
+            np.save(prefix.with_name(prefix.stem + "_raw_mask.npy"), mask)
+        except ImportError as e:
+            print(f"[i2i] skip mask viz: {e}")
+        print(f"[i2i] saved raw pred/cond/depth/mask at {res}x{res} next to {prefix.name}")
 
     # ── Compose full-resolution output ────────────────────────────────────
     if use_residual:
