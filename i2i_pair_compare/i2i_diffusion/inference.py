@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -45,6 +45,13 @@ def _resize_2d(arr: np.ndarray, size_hw: Tuple[int, int], mode: str = "bilinear"
         (size_hw[1], size_hw[0]), pil_mode
     )
     return np.array(img, dtype=np.float32)
+
+
+def _save_L_as_gray(L: np.ndarray, path: Path) -> None:
+    """Save an L channel in [0, 100] as an 8-bit grayscale PNG."""
+    arr = np.clip(L.astype(np.float32) * (255.0 / 100.0), 0.0, 255.0).astype(np.uint8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(arr, mode="L").save(path)
 
 
 def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, dict]:
@@ -92,6 +99,7 @@ def predict_L(
     use_residual: bool = True,
     guidance_scale: float = 1.0,
     seed: int | None = None,
+    save_raw_prefix: Optional[Path] = None,
 ) -> np.ndarray:
     """Run the diffusion model and return predicted L at full resolution."""
     H, W = L_normal_full.shape
@@ -133,6 +141,19 @@ def predict_L(
     x = torch.clamp(x, -1.0, 1.0).cpu().numpy()[0, 0]
     L_pred_low = (x + 1.0) * 50.0  # back to [0, 100]
 
+    # ── Optional: dump exactly what the model saw and produced ────────────
+    # Saves four sibling files next to the main output so you can inspect
+    # what the diffusion network learned, with no residual or chroma fix-up.
+    if save_raw_prefix is not None:
+        prefix = Path(save_raw_prefix)
+        L_pred_clipped = np.clip(L_pred_low.astype(np.float32), 0.0, 100.0)
+        L_cond_clipped = np.clip(L_normal_low.astype(np.float32), 0.0, 100.0)
+        _save_L_as_gray(L_pred_clipped, prefix.with_name(prefix.stem + "_raw_pred.png"))
+        _save_L_as_gray(L_cond_clipped, prefix.with_name(prefix.stem + "_raw_cond.png"))
+        np.save(prefix.with_name(prefix.stem + "_raw_pred.npy"), L_pred_clipped)
+        np.save(prefix.with_name(prefix.stem + "_raw_cond.npy"), L_cond_clipped)
+        print(f"[i2i] saved raw pred/cond at {res}x{res} next to {prefix.name}")
+
     if use_residual:
         residual_low = (L_pred_low - L_normal_low).astype(np.float32)
         residual_full = _resize_2d(residual_low, (H, W), mode="bilinear")
@@ -155,6 +176,7 @@ def run(
     use_residual: bool = True,
     guidance_scale: float = 1.0,
     save_L_npy: bool = False,
+    save_raw: bool = False,
     seed: int | None = None,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -166,6 +188,7 @@ def run(
     A = lab_full[..., 1]
     B = lab_full[..., 2]
 
+    out_path = Path(out)
     L_pred_full = predict_L(
         model,
         cfg,
@@ -178,10 +201,10 @@ def run(
         use_residual=use_residual,
         guidance_scale=guidance_scale,
         seed=seed,
+        save_raw_prefix=out_path if save_raw else None,
     )
 
     rgb_out = recombine_L_with_chroma(L_pred_full, A, B)
-    out_path = Path(out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(rgb_out).save(out_path)
     print(f"[i2i] saved {out_path}")
@@ -202,7 +225,11 @@ def main() -> None:
     parser.add_argument("--no_residual", action="store_true",
                         help="Disable residual upsampling (default ON).")
     parser.add_argument("--guidance_scale", type=float, default=1.0)
-    parser.add_argument("--save_L_npy", action="store_true")
+    parser.add_argument("--save_L_npy", action="store_true",
+                        help="Also save predicted L (full-res, [0,100]) as <out>.L.npy.")
+    parser.add_argument("--save_raw", action="store_true",
+                        help="Also dump model's raw L pred and the input cond L at "
+                             "training resolution (PNG + .npy, no residual / no chroma).")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
@@ -217,6 +244,7 @@ def main() -> None:
         use_residual=not args.no_residual,
         guidance_scale=args.guidance_scale,
         save_L_npy=args.save_L_npy,
+        save_raw=args.save_raw,
         seed=args.seed,
     )
 
