@@ -50,19 +50,19 @@ data:
   #normal_dir: "../../../data/datasets/kvasir_classified/none"
   #depth_dir:  "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
   
-  pairs_dir: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs"
+  pairs_dir: "../../../projects/i2i_diff_hybrid_v1/outputs/pairs"
   normal_dir: "../../../data/datasets/kvasir_classified/none_filtered"
 
   #normal_dir: "../../../../data/datasets/kvasir_classified/none"
-  depth_dir:  "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
+  depth_dir:  "../../../projects/i2i_diff_hybrid_v1/outputs/pairs/depth"
 
 # --- Output paths ---
 # Each per-domain training run writes into a sub-directory of `root`
 # named after `domain` (overridable via --output_subdir).
 output:
-  root: "/../../projects/i2i_diff_aug_dep_v3_sep_v2/outputs"
-  checkpoints_dir: "../../../projects/i2i_diff_aug_dep_v3_sep_v2/outputs/checkpoints"
-  samples_dir: "../../../projects/i2i_diff_aug_dep_v3_sep_v2/outputs/samples"
+  root: "../../../projects/i2i_diff_v3_with_hadepth/outputs"
+  checkpoints_dir: "../../../projects/i2i_diff_v3_with_hadepth/outputs/checkpoints"
+  samples_dir: "../../../projects/i2i_diff_v3_with_hadepth/outputs/samples"
 
 # --- Image settings ---
 image:
@@ -188,33 +188,30 @@ content_mask:
   erode_iter:     2     # erode the boundary slightly to avoid edge bleed
 
 # --- Focal blend (force underexposure to stay in deep zones only) ---
-# Even inside the FOV the model can leak the effect onto mid-depth tissue
-# near the light source. A depth-driven blend weight lets the model fully
-# act only in the deepest regions and falls off to the original L
-# elsewhere. alpha(d) = ((farness - knee) / (1 - knee))^gamma in [floor, 1].
-#
-# gamma was lowered (2.5 → 1.6) and knee → 0 so the dark zone covers the
-# whole depth-far half of the FOV instead of collapsing onto a tight ring
-# around the deepest pixel. Combined with `analytic_floor` below, the
-# darkening reaches L≈0 in the cavity AND extends across a believable area.
+# Was a band-aid for the model leaking the effect onto near tissue when it
+# wasn't depth-aware enough. With min-SNR-γ training the depth-awareness
+# now lives inside the model itself (the supervision targets already
+# encode it), so this depth-driven α blend is redundant. Re-enable as a
+# safety net only if a fresh checkpoint still leaks effect into shallow
+# regions.
 focal_blend:
-  enable:       true
+  enable:       false
   gamma:        1.6   # lower = wider effect zone
   knee:         0.0   # no dead-zone — even the slightly-far tissue darkens
   floor:        0.0   # min α; 0 = fully suppress effect on near tissue
   smooth_sigma: 4.0   # gaussian smoothing of α (px at 512px ref)
 
 # --- Analytic floor (definitive strength clamp on the model output) ---
-# DDPMs trained with MSE/L1 + extreme-weighted L1 still regress toward the
-# conditional mean — the predicted L in the deep cavity ends up around
-# 40–55 instead of the 0–10 the synthetic training targets actually hit.
-# `depth_aware_augment_lab` is the function that produced those targets;
-# we run it at inference with strong parameters and clamp the model's L
-# against it (np.minimum for underexposed, np.maximum for overexposed).
-# The model can only DEEPEN the effect, never weaken it. This is the fix
-# for "looks just grayed instead of dark".
+# Was the regression-to-mean band-aid: clamp the model's L against the
+# analytic depth-aware target so it could only DEEPEN, never weaken. With
+# min-SNR-γ training the model commits to extremes on its own, so this
+# clamp is the dominant reason the old "raw" output was barely darker than
+# source while the "full" output was strong. Disabled so the diffusion
+# model is the source of truth. Re-enable as a mild safety net (with
+# weaker shift_magnitude/core_clip_blend) if a fresh checkpoint under-
+# darkens the deepest cavities.
 analytic_floor:
-  enable:                true
+  enable:                false
   shift_magnitude_under: 85.0   # max L drop applied in deep cavity
   shift_magnitude_over:  70.0   # max L lift applied near light source
   gamma_under:           1.7    # lower = wider underexposure zone
