@@ -1,5 +1,5 @@
 data:
-  pairs_root: "../../../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs"
+  pairs_root: "../../../../projects/i2i_diff_hybrid_v1/outputs/pairs"
   resolution: 256
   num_workers: 2
   flip_prob: 0.5
@@ -37,14 +37,16 @@ training:
   sample_every: 5000
   ckpt_every: 5000
   val_every: 5000
-  out_dir: "../../../../../projects/i2i_diff_pair_compare/outputs"
+  out_dir: "../../../../projects/i2i_diff_hybrid_v1/outputs"
   resume: null
   reset_ema_on_resume: false   # set true to wipe EMA shadow and restart warmup on resume
 
 inference:
-  ckpt: "../../../../../projects/i2i_diff_pair_compare/outputs/best.pt"
+  ckpt: "../../../../projects/i2i_diff_hybrid_v1/outputs/best.pt"
   num_sampling_steps: 25
   scheduler: ddim
   resolution: 256
   use_residual: true
   guidance_scale: 1.5
+  mask_strategy: hybrid     # match what generate_pairs.py used; also used for --save_raw viz
+  vignette_threshold: 5.0      # L below this = camera mask (excluded from augmentation)

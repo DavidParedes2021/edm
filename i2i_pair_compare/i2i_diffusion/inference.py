@@ -61,40 +61,85 @@ def _save_unit_as_gray(arr01: np.ndarray, path: Path) -> None:
     Image.fromarray(a, mode="L").save(path)
 
 
-def _build_depth_mask(
-    depth: np.ndarray,
+def _build_aug_mask(
+    L_low: np.ndarray,
+    depth_low: np.ndarray,
     mode: str,
-    gamma_over: float = 1.5,
-    gamma_under: float = 2.0,
+    strategy: str = "luminance",
+    gamma_over: float = 2.0,
+    gamma_under: float = 2.5,
     smooth_sigma_base: float = 6.0,
+    vignette_threshold: float = 5.0,
+    hybrid_blend: float = 0.5,
 ) -> np.ndarray:
-    """Reproduce the rule-based depth mask from `code _to_generate_pairs/depth_augment.py`.
+    """Reproduce the rule-based augmentation mask used by `generate_pairs.py`.
 
-    For 'over' the mask peaks on the *nearest* pixels (depth=1), for 'under' on
-    the *farthest* pixels (depth=0). Smoothed and renormalised to [0, 1].
-    Smoothing sigma scales with image size relative to the original 512 px ref.
+    Mirrors `code _to_generate_pairs/depth_augment.py` so the saved `_raw_mask`
+    matches what training was built on. Strategy options:
+      'luminance' — peak where L is small (under) or large (over). Robust for
+                    endoscopy where light falloff with distance makes L itself
+                    a depth proxy. The vignette mask zeroes out camera-border.
+      'depth'     — peak where depth is small (under) or large (over).
+      'hybrid'    — weighted blend.
     """
     try:
         from scipy.ndimage import gaussian_filter
     except ImportError as e:  # pragma: no cover
         raise ImportError(
-            "scipy is required for the depth-mask visualisation; install with "
-            "`pip install scipy`. (Already a dependency of the dataset generator.)"
+            "scipy is required for the augmentation-mask visualisation; "
+            "install with `pip install scipy`."
         ) from e
-    H, W = depth.shape
+
+    H, W = L_low.shape
     scale = max(H, W) / 512.0
     sigma = smooth_sigma_base * scale
-    if mode in ("over", "overexposed"):
-        gamma = gamma_over
-        m = np.power(np.clip(depth, 0.0, 1.0), gamma)
+    visible = (L_low > float(vignette_threshold)).astype(np.float32)
+
+    def _luminance_mask() -> np.ndarray:
+        L_norm = np.clip(L_low, 0.0, 100.0) / 100.0
+        vis_b = visible.astype(bool)
+        # Neutralise vignette so it doesn't bleed huge values into the smoother:
+        # under: set vignette L=1.0 so (1-L)^gamma = 0; over: set L=0 so L^gamma = 0.
+        if mode in ("over", "overexposed"):
+            L_norm = np.where(vis_b, L_norm, 0.0)
+        else:
+            L_norm = np.where(vis_b, L_norm, 1.0)
+        if vis_b.any():
+            Lv = L_norm[vis_b]
+            lo, hi = np.percentile(Lv, [5.0, 95.0])
+            if hi > lo + 1e-6:
+                L_norm = np.clip((L_norm - lo) / (hi - lo), 0.0, 1.0)
+        if mode in ("over", "overexposed"):
+            m = np.power(L_norm, gamma_over)
+        else:
+            m = np.power(1.0 - L_norm, gamma_under)
+        if sigma > 0:
+            m = gaussian_filter(m.astype(np.float32), sigma=sigma)
+        m = m * visible
+        mx = float(m.max())
+        return (m / mx) if mx > 1e-6 else m
+
+    def _depth_mask() -> np.ndarray:
+        d = np.clip(depth_low, 0.0, 1.0)
+        if mode in ("over", "overexposed"):
+            m = np.power(d, gamma_over)
+        else:
+            m = np.power(1.0 - d, gamma_under)
+        if sigma > 0:
+            m = gaussian_filter(m.astype(np.float32), sigma=sigma)
+        m = m * visible
+        mx = float(m.max())
+        return (m / mx) if mx > 1e-6 else m
+
+    if strategy == "luminance":
+        m = _luminance_mask()
+    elif strategy == "depth":
+        m = _depth_mask()
+    elif strategy == "hybrid":
+        b = float(np.clip(hybrid_blend, 0.0, 1.0))
+        m = b * _luminance_mask() + (1.0 - b) * _depth_mask()
     else:
-        gamma = gamma_under
-        m = np.power(np.clip(1.0 - depth, 0.0, 1.0), gamma)
-    if sigma > 0:
-        m = gaussian_filter(m.astype(np.float32), sigma=sigma)
-    mx = float(m.max())
-    if mx > 1e-6:
-        m = m / mx
+        raise ValueError(f"unknown strategy: {strategy}")
     return np.clip(m, 0.0, 1.0).astype(np.float32)
 
 
@@ -214,14 +259,26 @@ def predict_L(
         np.save(prefix.with_name(prefix.stem + "_raw_pred.npy"), L_pred_clipped)
         np.save(prefix.with_name(prefix.stem + "_raw_cond.npy"), L_cond_clipped)
         np.save(prefix.with_name(prefix.stem + "_raw_depth.npy"), depth_clipped)
-        # Rule-based depth mask the original augmenter used to make the target.
+        # Vignette / visible-tissue mask
+        vignette_threshold = float(cfg.get("inference", {}).get("vignette_threshold", 5.0))
+        visible = (L_cond_clipped > vignette_threshold).astype(np.float32)
+        _save_unit_as_gray(visible, prefix.with_name(prefix.stem + "_raw_visible.png"))
+        # Rule-based augmentation mask (mirrors generate_pairs.py)
         try:
-            mask = _build_depth_mask(depth_clipped, mode=mode)
+            strategy = str(cfg.get("inference", {}).get("mask_strategy", "luminance"))
+            mask = _build_aug_mask(
+                L_low=L_cond_clipped,
+                depth_low=depth_clipped,
+                mode=mode,
+                strategy=strategy,
+                vignette_threshold=vignette_threshold,
+            )
             _save_unit_as_gray(mask, prefix.with_name(prefix.stem + "_raw_mask.png"))
             np.save(prefix.with_name(prefix.stem + "_raw_mask.npy"), mask)
         except ImportError as e:
             print(f"[i2i] skip mask viz: {e}")
-        print(f"[i2i] saved raw pred/cond/depth/mask at {res}x{res} next to {prefix.name}")
+        print(f"[i2i] saved raw cond/pred/depth/visible/mask at {res}x{res} "
+              f"next to {prefix.name}")
 
     # ── Compose full-resolution output ────────────────────────────────────
     if use_residual:
