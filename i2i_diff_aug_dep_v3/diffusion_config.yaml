@@ -50,19 +50,19 @@ data:
   #normal_dir: "../../../data/datasets/kvasir_classified/none"
   #depth_dir:  "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
   
-  pairs_dir: "../../../projects/i2i_diff_hybrid_v1/outputs/pairs"
-  normal_dir: "../../../data/datasets/kvasir_classified/none_filtered"
+  pairs_dir: "../../../../projects/i2i_diff_hybrid_v1/outputs/pairs"
+  normal_dir: "../../../../data/datasets/kvasir_classified/none_filtered"
 
   #normal_dir: "../../../../data/datasets/kvasir_classified/none"
-  depth_dir:  "../../../projects/i2i_diff_hybrid_v1/outputs/pairs/depth"
+  depth_dir:  "../../../../projects/i2i_diff_hybrid_v1/outputs/pairs/depth"
 
 # --- Output paths ---
 # Each per-domain training run writes into a sub-directory of `root`
 # named after `domain` (overridable via --output_subdir).
 output:
-  root: "../../../projects/i2i_diff_v3_with_hadepth/outputs"
-  checkpoints_dir: "../../../projects/i2i_diff_v3_with_hadepth/outputs/checkpoints"
-  samples_dir: "../../../projects/i2i_diff_v3_with_hadepth/outputs/samples"
+  root: "../../../../projects/i2i_diff_v3_with_hadepth/outputs"
+  checkpoints_dir: "../../../../projects/i2i_diff_v3_with_hadepth/outputs/checkpoints"
+  samples_dir: "../../../../projects/i2i_diff_v3_with_hadepth/outputs/samples"
 
 # --- Image settings ---
 image:
