@@ -38,7 +38,7 @@
 # CLI override: pass `--domain overexposed` or
 # `--domain underexposed` to either diffusion_train.py or
 # diffusion_inference.py to override this field for one run.
-domain: "underexposed"
+domain: "overexposed"
 
 # --- Data paths ---
 data:
@@ -60,9 +60,9 @@ data:
 # Each per-domain training run writes into a sub-directory of `root`
 # named after `domain` (overridable via --output_subdir).
 output:
-  root: "../../../../projects/i2i_diff_v3_with_hadepth/outputs"
-  checkpoints_dir: "../../../../projects/i2i_diff_v3_with_hadepth/outputs/checkpoints"
-  samples_dir: "../../../../projects/i2i_diff_v3_with_hadepth/outputs/samples"
+  root: "../../../../projects/i2i_diff_v3_with_hadepth_over/outputs"
+  checkpoints_dir: "../../../../projects/i2i_diff_v3_with_hadepth_over/outputs/checkpoints"
+  samples_dir: "../../../../projects/i2i_diff_v3_with_hadepth_over/outputs/samples"
 
 # --- Image settings ---
 image:

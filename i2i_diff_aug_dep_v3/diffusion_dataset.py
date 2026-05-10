@@ -192,7 +192,10 @@ class NormalInferenceDataset(Dataset):
         normal_dir: str,
         image_size: int = 256,
         depth_dir: str = None,                 # if None, depth is computed on-the-fly
-        depth_backend: str = "midas",          # 'midas' | 'midas_hybrid' | 'depth_anything_v2_hf'
+        depth_backend: str = "hadepth",        # 'hadepth' | 'midas' | 'midas_hybrid' | 'depth_anything_v2_hf'
+        hadepth_repo: str = None,              # path to HADepth/ folder (used by 'hadepth')
+        hadepth_ckpt: str = None,              # path to depth_model.pth or its parent dir
+        hadepth_vignette_threshold: float = 5.0,
     ):
         self.image_size = image_size
         folder = Path(normal_dir)
@@ -203,7 +206,10 @@ class NormalInferenceDataset(Dataset):
 
         self.depth_dir = Path(depth_dir) if depth_dir else None
         self._depth_backend = depth_backend
-        self._depth_model = None       # lazy — may be pipe (HF) or (model, transform) tuple (MiDaS)
+        self._hadepth_repo = hadepth_repo
+        self._hadepth_ckpt = hadepth_ckpt
+        self._hadepth_vt = float(hadepth_vignette_threshold)
+        self._depth_model = None       # lazy — may be pipe (HF) or (model, transform) tuple (MiDaS/HADepth)
 
     def _ensure_depth_model(self):
         """Lazy-init the on-the-fly depth model. Prefers cached .npy on disk;
@@ -215,7 +221,62 @@ class NormalInferenceDataset(Dataset):
         dev = _t.device("cuda" if _t.cuda.is_available() else "cpu")
         backend = self._depth_backend
 
-        if backend in ("midas", "midas_hybrid"):
+        if backend == "hadepth":
+            # HADepth (endoscopy-specialised, used to generate the training
+            # pairs). Mirrors the loader in
+            # `code _to_generate_pairs/depth_estimator.py` so on-the-fly
+            # depth matches the training-time convention exactly.
+            import sys as _sys
+            import types as _types
+            repo = self._hadepth_repo or str(
+                Path(__file__).resolve().parent / "HADepth"
+            )
+            ckpt = self._hadepth_ckpt or str(Path(repo) / "HADepth_fullmodel")
+            repo_p = Path(repo).expanduser().resolve()
+            if not repo_p.is_dir():
+                raise RuntimeError(
+                    f"[InferenceDataset] HADepth repo not found at {repo_p}. "
+                    f"Pass hadepth_repo=... or precompute depth into depth_dir."
+                )
+            if str(repo_p) not in _sys.path:
+                _sys.path.insert(0, str(repo_p))
+            # HADepth's models/backbones/layers/utils.py references MAB.py
+            # which isn't shipped; stub it so the import succeeds.
+            _stub_name = "models.backbones.layers.MAB"
+            if _stub_name not in _sys.modules:
+                _sys.modules[_stub_name] = _types.ModuleType(_stub_name)
+            from models.hadepth import hadepth as hadepth_class  # type: ignore
+            m = hadepth_class(
+                backbone_size="base",
+                r=4,
+                lora_type="dora",
+                image_shape=(224, 280),
+                pretrained_path=None,
+                residual_block_indexes=[2, 5, 8, 11],
+                include_cls_token=True,
+            )
+            ck = Path(ckpt).expanduser().resolve()
+            if ck.is_dir():
+                ck = ck / "depth_model.pth"
+            if not ck.is_file():
+                raise RuntimeError(
+                    f"[InferenceDataset] HADepth checkpoint not found: {ck}"
+                )
+            state = _t.load(str(ck), map_location="cpu")
+            model_dict = m.state_dict()
+            matched = {
+                k: v for k, v in state.items()
+                if k in model_dict and v.shape == model_dict[k].shape
+            }
+            m.load_state_dict(matched, strict=False)
+            print(
+                f"[InferenceDataset] lazy-loaded HADepth: "
+                f"matched {len(matched)}/{len(model_dict)} keys from {ck}"
+            )
+            m = m.to(dev).eval()
+            self._depth_model = ("hadepth", m, None, dev)
+
+        elif backend in ("midas", "midas_hybrid"):
             mtype = "DPT_Large" if backend == "midas" else "DPT_Hybrid"
             print(f"[InferenceDataset] lazy-loading MiDaS {mtype} via torch.hub")
             m = _t.hub.load("intel-isl/MiDaS", mtype).to(dev).eval()
@@ -247,6 +308,15 @@ class NormalInferenceDataset(Dataset):
         else:
             raise ValueError(f"unknown depth_backend: {backend}")
 
+    @staticmethod
+    def _detect_visible_mask(img_rgb: np.ndarray, threshold: float = 5.0) -> np.ndarray:
+        """Boolean mask: True on tissue, False on the camera vignette.
+        Same convention used by HADepth in the pair-generation pipeline."""
+        Y = (0.2126 * img_rgb[..., 0] + 0.7152 * img_rgb[..., 1]
+             + 0.0722 * img_rgb[..., 2])
+        L = (Y.astype(np.float32) / 255.0) * 100.0
+        return L > float(threshold)
+
     def _load_or_compute_depth(self, path: Path, img_pil: Image.Image) -> np.ndarray:
         # 1. try disk cache
         if self.depth_dir is not None:
@@ -259,6 +329,32 @@ class NormalInferenceDataset(Dataset):
         self._ensure_depth_model()
         kind, model_or_pipe, transform, dev = self._depth_model
         import torch as _t
+
+        if kind == "hadepth":
+            img_np = np.array(img_pil.convert("RGB"))
+            H, W = img_np.shape[:2]
+            x = (_t.from_numpy(img_np.astype(np.float32) / 255.0)
+                 .permute(2, 0, 1).unsqueeze(0).to(dev))
+            with _t.no_grad():
+                out = model_or_pipe(x)
+                disp = out[("disp", 0)]
+                disp = _t.nn.functional.interpolate(
+                    disp, size=(H, W), mode="bicubic", align_corners=False
+                )
+            d = disp.squeeze().detach().cpu().numpy().astype(np.float32)
+            visible = self._detect_visible_mask(img_np, threshold=self._hadepth_vt)
+            if visible.any():
+                dv = d[visible]
+                lo = float(np.percentile(dv, 2.0))
+                hi = float(np.percentile(dv, 98.0))
+                if hi > lo + 1e-6:
+                    d = np.clip((d - lo) / (hi - lo), 0.0, 1.0)
+                else:
+                    d = np.full_like(d, 0.5)
+            else:
+                d = np.full_like(d, 0.5)
+            d[~visible] = 1.0  # vignette → near, matches training-time depth
+            return d.astype(np.float32)
 
         if kind == "midas":
             img_np = np.array(img_pil.convert("RGB"))

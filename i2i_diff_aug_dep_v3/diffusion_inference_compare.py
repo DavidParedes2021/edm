@@ -1,31 +1,38 @@
 #!/usr/bin/env python3
 """
-diffusion_inference.py — Single-domain depth-aware inference.
+diffusion_inference_compare.py — Save raw vs. post-processed outputs.
 
-Each checkpoint is dedicated to one direction (overexposed OR underexposed).
-Run inference twice with different --checkpoint and --domain to cover both.
+For every input frame, runs the DDIM model exactly once and writes three PNGs:
 
-Pipeline at each frame:
-    1. Load RGB → LAB; keep AB untouched.
-    2. Load / compute depth map (from --depth_dir cache, or on-the-fly).
-    3. Downsample (L, depth) to model resolution (256×256).
-    4. DDIM denoise. Model input is 3-channel: [noisy_target_L, source_L, depth].
-       No class embedding — the model is fully specialised to its domain.
-    5. Upsample predicted L to original resolution.
-    6. Texture reinjection with HF gate — original high-pass is attenuated
-       toward `texture_gate.floor` in extreme cores so dark regions stay dark
-       and bright regions stay bright (this is what the previous build was
-       missing, causing "barely noticeable" effects).
-         L_final = low_pass(L_pred) + hf_gate(L_pred, mode) * high_pass(L_orig)
-    7. Depth-aware chroma attenuation on (A, B).
-    8. LAB → RGB, save.
+    {output_dir}/{domain}/l_only/{stem}.png
+        Pure model output: the predicted L channel rendered as greyscale via
+        Lab(L, 0, 0) → RGB. No chroma at all. This is the closest possible
+        view of what the diffusion network alone produced.
+
+    {output_dir}/{domain}/raw/{stem}.png
+        Raw model L (upsampled) combined with the original A,B chroma.
+        No analytic floor, no texture reinjection, no focal blend, no chroma
+        attenuation, no content mask. This isolates what the diffusion
+        network alone produces in colour.
+
+    {output_dir}/{domain}/full/{stem}.png
+        Same model output run through the full pipeline from
+        diffusion_inference.py (analytic floor + texture reinjection with
+        HF gate + focal blend + content-mask passthrough + chroma
+        attenuation).
+
+All three branches share one DDIM denoise pass per frame so the only variable
+between outputs is the postprocessing. The model conditioning uses the cleaned
+depth (same as production inference) so the model sees a reasonable depth map
+in every case — depth cleaning is preprocessing on the model *input*, not
+postprocessing on its output.
 
 Usage:
-    python diffusion_inference.py \\
+    python diffusion_inference_compare.py \\
         --config diffusion_config.yaml \\
         --checkpoint .../checkpoints/under/best.pt \\
         --domain underexposed \\
-        --output_dir ./my_output
+        --output_dir ./compare_output
 """
 
 import argparse
@@ -49,7 +56,9 @@ from diffusion_train import (
 )
 from exposure_augment import lab_to_rgb
 from depth_augment import depth_aware_augment_lab
-from chroma_attenuation import attenuate_chroma, texture_gate, DEFAULT_CFG as CHROMA_DEFAULT_CFG
+from chroma_attenuation import (
+    attenuate_chroma, texture_gate, DEFAULT_CFG as CHROMA_DEFAULT_CFG,
+)
 from inference_postprocess import (
     detect_content_mask,
     clean_depth_with_mask,
@@ -59,26 +68,22 @@ from inference_postprocess import (
 
 
 @torch.no_grad()
-def run_inference(
+def run_compare(
     cfg: dict,
     checkpoint_path: str,
     domain: str = None,
     output_dir: str = None,
     depth_dir: str = None,
     texture_sigma_base: float = 3.0,
+    seed: int = None,
     depth_backend: str = "hadepth",
     hadepth_repo: str = None,
     hadepth_ckpt: str = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── checkpoint ───────────────────────────────────────────────────────
-    # Load first so we can pick the domain up from the embedded config —
-    # checkpoints are domain-specialised, so the safest source of truth is
-    # the checkpoint itself.
+    # ── checkpoint + domain resolution (mirrors diffusion_inference.py) ──
     ckpt = torch.load(checkpoint_path, map_location="cpu")
-
-    # Resolve domain — priority: CLI arg > checkpoint's saved config > config file.
     cli_domain = (domain or "").strip().lower() or None
     ckpt_domain = (
         (ckpt.get("config") or {}).get("domain", "") or ""
@@ -90,29 +95,18 @@ def run_inference(
             f"`domain` must be 'overexposed' or 'underexposed' "
             f"(got {domain!r}). Set in config, embed in checkpoint, or pass --domain."
         )
-    if cli_domain and ckpt_domain and cli_domain != ckpt_domain:
-        print(f"[Inference] WARNING: --domain={cli_domain!r} overrides "
-              f"checkpoint's saved domain {ckpt_domain!r}. "
-              f"Make sure that's intentional.")
-    elif ckpt_domain and cfg_domain and ckpt_domain != cfg_domain and not cli_domain:
-        print(f"[Inference] using checkpoint's domain {ckpt_domain!r} "
-              f"(config file says {cfg_domain!r}).")
+    print(f"[Compare] device = {device}, domain = {domain}")
 
-    print(f"[Inference] device = {device}, domain = {domain}")
-
-    # ── model ────────────────────────────────────────────────────────────
+    # ── model (prefer EMA weights, like diffusion_inference.py) ─────────
     model = build_model(cfg, device)
-    # Reconcile diffusers attention key names against whatever convention the
-    # locally-installed `diffusers` produced for this freshly-built UNet.
     if "model" in ckpt:
         ckpt["model"] = align_attn_keys_to_model(ckpt["model"], model)
     if "ema" in ckpt:
         ckpt["ema"] = align_attn_keys_to_model(ckpt["ema"], model)
-    if "ema" in ckpt:
         ema = EMAModel(model)
         ema.load_state_dict(ckpt["ema"])
         ema.apply(model)
-        print("[Inference] loaded EMA weights")
+        print("[Compare] loaded EMA weights")
     else:
         model.load_state_dict(ckpt["model"])
     model.eval()
@@ -127,10 +121,9 @@ def run_inference(
     ddim.set_timesteps(num_steps, device=device)
 
     # ── dataset ──────────────────────────────────────────────────────────
-    # prefer CLI arg, else config (data.depth_dir), else on-the-fly
     resolved_depth_dir = depth_dir or cfg.get("data", {}).get("depth_dir")
     if resolved_depth_dir and not Path(resolved_depth_dir).is_dir():
-        print(f"[Inference] depth_dir '{resolved_depth_dir}' not found; "
+        print(f"[Compare] depth_dir '{resolved_depth_dir}' not found; "
               f"depth will be computed on-the-fly.")
         resolved_depth_dir = None
 
@@ -149,16 +142,14 @@ def run_inference(
         num_workers=0,
     )
 
-    # ── chroma cfg ───────────────────────────────────────────────────────
+    # ── post-processing config (only used by the 'full' branch) ─────────
     chroma_cfg = dict(CHROMA_DEFAULT_CFG)
     chroma_cfg.update(cfg.get("chroma", {}))
 
-    # ── texture-gate cfg ─────────────────────────────────────────────────
     tg_cfg = cfg.get("texture_gate", {}) or {}
     tg_knee = float(tg_cfg.get("knee", 30.0))
     tg_floor = float(tg_cfg.get("floor", 0.05))
 
-    # ── focal-blend cfg (suppress effect on non-deep tissue + UI panels) ─
     fb_cfg = cfg.get("focal_blend", {}) or {}
     fb_enable = bool(fb_cfg.get("enable", True))
     fb_gamma = float(fb_cfg.get("gamma", 1.6))
@@ -167,18 +158,12 @@ def run_inference(
     fb_smooth = float(fb_cfg.get("smooth_sigma", 4.0))
     fb_model_trust = float(fb_cfg.get("model_trust", 0.0))
     fb_model_strength_L = float(fb_cfg.get("model_strength_L", 25.0))
+
     cm_cfg = cfg.get("content_mask", {}) or {}
     cm_enable = bool(cm_cfg.get("enable", True))
     cm_threshold = float(cm_cfg.get("luma_threshold", 8.0))
     cm_erode = int(cm_cfg.get("erode_iter", 2))
 
-    # ── Analytic-floor cfg ───────────────────────────────────────────────
-    # The DDPM regresses toward the conditional mean and routinely under-
-    # shoots the L-extreme that the synthetic training targets actually
-    # reached. We compute the analytical depth-aware target with strong
-    # parameters and clamp the model's predicted L against it (min for
-    # underexposed, max for overexposed). The diffusion model can only
-    # ever DEEPEN the effect, never weaken it.
     af_cfg = cfg.get("analytic_floor", {}) or {}
     af_enable = bool(af_cfg.get("enable", True))
     af_shift_under = float(af_cfg.get("shift_magnitude_under", 85.0))
@@ -190,25 +175,35 @@ def run_inference(
     af_hf_kill = float(af_cfg.get("hf_kill", 0.97))
     af_smooth_sigma_base = float(af_cfg.get("smooth_sigma_base", 6.0))
 
-    # ── output root ──────────────────────────────────────────────────────
+    # ── output dirs ──────────────────────────────────────────────────────
     out_root = (Path(output_dir) if output_dir
-                else Path(cfg["output"]["root"]) / "generated")
-    out_dir = out_root / domain
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n[Generating] {domain} ({num_steps} DDIM steps) → {out_dir}")
+                else Path(cfg["output"]["root"]) / "compare")
+    l_only_dir = out_root / domain / "l_only"
+    raw_dir = out_root / domain / "raw"
+    full_dir = out_root / domain / "full"
+    l_only_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    full_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n[Generating] {domain} ({num_steps} DDIM steps)")
+    print(f"  l_only → {l_only_dir}")
+    print(f"  raw    → {raw_dir}")
+    print(f"  full   → {full_dir}")
 
     img_size = cfg["image"]["size"]
-    border_d = 1.0 if domain == "underexposed" else 0.0  # benign value for borders
+    border_d = 1.0 if domain == "underexposed" else 0.0
+
+    if seed is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     for source_L, depth, AB, L_orig_tensor, depth_full_tensor, paths, orig_hw in tqdm(
         loader, desc=domain
     ):
         B = source_L.shape[0]
 
-        # ── Per-sample content-mask + depth cleanup (full resolution) ────
-        # Borders/UI panels confuse both the depth estimator and the model.
-        # We compute a content mask from the original RGB, renormalise depth
-        # within content, and force border depth to a benign value.
+        # ── content mask + cleaned depth (used by the 'full' branch and
+        # for the model conditioning shared by both branches) ───────────
         rgb_origs = []
         masks_full = []
         depths_clean_full = []
@@ -231,9 +226,6 @@ def run_inference(
             masks_full.append(mask)
             depths_clean_full.append(d_clean)
 
-        # ── Re-derive model-resolution depth from the cleaned full depth ─
-        # The dataset's `depth` tensor was built from the raw cached depth.
-        # Replace it so the model conditioning is also clean.
         depths_clean_small = np.zeros((B, img_size, img_size), dtype=np.float32)
         for b in range(B):
             d_small = np.array(
@@ -243,52 +235,61 @@ def run_inference(
                 dtype=np.float32,
             )
             depths_clean_small[b] = np.clip(d_small, 0.0, 1.0)
-        # [-1, 1] for the UNet
         depth_t = torch.from_numpy(depths_clean_small * 2.0 - 1.0
                                    ).unsqueeze(1).to(device)
 
-        source_L = source_L.to(device)  # (B, 1, h, w) in [-1, 1]
-
-        # start from pure noise for the target L channel
+        source_L = source_L.to(device)
         x = torch.randn_like(source_L)
 
-        # DDIM loop — no class labels, model is single-domain.
         for t in ddim.timesteps:
             t_batch = torch.full((B,), t, dtype=torch.long, device=device)
-            model_input = torch.cat([x, source_L, depth_t], dim=1)  # (B, 3, h, w)
+            model_input = torch.cat([x, source_L, depth_t], dim=1)
             with autocast(enabled=cfg["training"]["mixed_precision"]):
                 pred_noise = model(model_input, t_batch,
                                    class_labels=None).sample
             x = ddim.step(pred_noise, t, x).prev_sample
 
-        # denormalise predicted L: [-1, 1] → [0, 100]
         L_pred_small = ((x.cpu().numpy()[:, 0] + 1.0) * 50.0).clip(0, 100)
 
         for b in range(B):
             H_o, W_o = int(orig_hw[0][b]), int(orig_hw[1][b])
-            ab    = AB[b].numpy()                  # (H_o, W_o, 2)
-            l_o   = L_orig_tensor[b].numpy()       # (H_o, W_o)
-            d_o   = depths_clean_full[b]           # cleaned depth, [0, 1]
-            mask  = masks_full[b]                  # bool (H_o, W_o)
+            ab    = AB[b].numpy()
+            l_o   = L_orig_tensor[b].numpy()
+            d_o   = depths_clean_full[b]
+            mask  = masks_full[b]
+            stem  = Path(paths[b]).stem
 
-            # upsample predicted L to original resolution
             L_pred_full = np.array(
                 Image.fromarray(L_pred_small[b].astype(np.float32),
                                 mode="F").resize(
                     (W_o, H_o), Image.LANCZOS
                 ),
                 dtype=np.float32,
-            )
+            ).clip(0.0, 100.0)
 
-            # ── Analytic floor: clamp model output to the analytic GT ──
-            # `depth_aware_augment_lab` is the same function that produced
-            # the supervised targets; running it at inference time with
-            # strong parameters gives a guaranteed, depth-correct envelope
-            # the model output cannot weaken.
+            # ── L-ONLY branch: model L with zero chroma → greyscale ─────
+            # Lab(L, 0, 0) → RGB gives the perceptually-correct greyscale
+            # view of just the diffusion network's L prediction.
+            zeros = np.zeros_like(L_pred_full, dtype=np.float32)
+            lab_l_only = np.stack([L_pred_full, zeros, zeros], axis=-1)
+            rgb_l_only = lab_to_rgb(lab_l_only)
+            Image.fromarray(rgb_l_only).save(str(l_only_dir / f"{stem}.png"))
+
+            # ── RAW branch: model L + original AB, no postprocessing ────
+            lab_raw = np.stack(
+                [L_pred_full, ab[..., 0], ab[..., 1]], axis=-1
+            )
+            rgb_raw = lab_to_rgb(lab_raw)
+            Image.fromarray(rgb_raw).save(str(raw_dir / f"{stem}.png"))
+
+            # ── FULL branch: full diffusion_inference.py pipeline ───────
+            L_pp = L_pred_full.copy()
+
             if af_enable:
                 af_shift = (af_shift_under if domain == "underexposed"
                             else af_shift_over)
-                af_kwargs = dict(
+                analytic_lab = depth_aware_augment_lab(
+                    rgb_origs[b], d_o, mode=domain,
                     strength=1.0,
                     shift_magnitude=af_shift,
                     gamma_over=af_gamma_over,
@@ -299,28 +300,20 @@ def run_inference(
                     core_clip_blend=af_core_clip_blend,
                     hf_kill=af_hf_kill,
                 )
-                analytic_lab = depth_aware_augment_lab(
-                    rgb_origs[b], d_o, mode=domain, **af_kwargs
-                )
                 L_analytic = analytic_lab[..., 0].astype(np.float32)
                 if domain == "underexposed":
-                    L_pred_full = np.minimum(L_pred_full, L_analytic)
+                    L_pp = np.minimum(L_pp, L_analytic)
                 else:
-                    L_pred_full = np.maximum(L_pred_full, L_analytic)
+                    L_pp = np.maximum(L_pp, L_analytic)
 
-            # ── Texture reinjection with HF gate ─────────────────────
             sigma = texture_sigma_base * max(H_o, W_o) / 512.0
             L_high     = l_o - gaussian_filter(l_o, sigma=sigma)
-            L_low_pred = gaussian_filter(L_pred_full, sigma=sigma)
-            hf_gate = texture_gate(L_low_pred, mode=domain,
-                                   knee=tg_knee, floor=tg_floor)
-            L_model = np.clip(L_low_pred + hf_gate * L_high,
-                              0.0, 100.0).astype(np.float32)
+            L_low_pred = gaussian_filter(L_pp, sigma=sigma)
+            hf_gate    = texture_gate(L_low_pred, mode=domain,
+                                      knee=tg_knee, floor=tg_floor)
+            L_model    = np.clip(L_low_pred + hf_gate * L_high,
+                                 0.0, 100.0).astype(np.float32)
 
-            # ── Depth-driven focal blend ─────────────────────────────
-            # Force tissue near the light source (high depth in 'under' mode)
-            # to remain at L_orig regardless of model leakage. Effect is
-            # only fully active in the deepest regions.
             if fb_enable:
                 fb_smooth_px = fb_smooth * max(H_o, W_o) / 512.0
                 alpha = focal_blend_alpha(
@@ -331,12 +324,6 @@ def run_inference(
             else:
                 alpha = np.ones_like(L_model, dtype=np.float32)
 
-            # ── Model-trust boost ────────────────────────────────────
-            # Where the model's L diverges from L_orig in the domain's
-            # direction, raise α toward 1 — even if depth alone wouldn't
-            # justify it. Lets flat scenes (no clear deep cavity) inherit
-            # the diffusion model's distribution instead of staying near
-            # the original brightness.
             if fb_model_trust > 0.0:
                 fb_smooth_px = fb_smooth * max(H_o, W_o) / 512.0
                 s = model_trust_boost(
@@ -346,30 +333,23 @@ def run_inference(
                 )
                 alpha = alpha + (1.0 - alpha) * fb_model_trust * s
 
-            # ── Content-mask passthrough ─────────────────────────────
-            # Outside the endoscopic FOV the model output is noise. Clamp
-            # alpha to 0 there so we keep the original L exactly.
             alpha = alpha * mask.astype(np.float32)
 
             L_final = (alpha * L_model + (1.0 - alpha) * l_o).astype(np.float32)
             L_final = np.clip(L_final, 0.0, 100.0)
 
-            # ── Depth-aware chroma attenuation (inside content only) ─
             A_att, B_att = attenuate_chroma(
                 ab[..., 0], ab[..., 1],
                 L_new=L_final, L_orig=l_o, depth=d_o,
                 mode=domain, cfg=chroma_cfg,
             )
-            # Outside the content mask, keep original chroma exactly.
             m_f = mask.astype(np.float32)
             A_new = m_f * A_att + (1.0 - m_f) * ab[..., 0]
             B_new = m_f * B_att + (1.0 - m_f) * ab[..., 1]
 
-            lab = np.stack([L_final, A_new, B_new], axis=-1)
-            rgb = lab_to_rgb(lab)
-
-            stem = Path(paths[b]).stem
-            Image.fromarray(rgb).save(str(out_dir / f"{stem}.png"))
+            lab_full = np.stack([L_final, A_new, B_new], axis=-1)
+            rgb_full = lab_to_rgb(lab_full)
+            Image.fromarray(rgb_full).save(str(full_dir / f"{stem}.png"))
 
     print(f"\n[Done] outputs in {out_root}")
 
@@ -379,16 +359,13 @@ def main():
     parser.add_argument("--config", type=str, default="diffusion_config.yaml")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--domain", type=str, default=None,
-                        choices=["overexposed", "underexposed"],
-                        help="Which direction this checkpoint targets. "
-                             "Defaults to the 'domain' field in the config.")
-    parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--depth_dir", type=str, default=None,
-                        help="Directory of pre-computed depth .npy files "
-                             "(one per normal frame). If omitted, depth is "
-                             "computed on-the-fly via Depth Anything V2.")
-    parser.add_argument("--texture_sigma", type=float, default=3.0,
-                        help="Gaussian sigma for texture decomposition (at 512px ref).")
+                        choices=["overexposed", "underexposed"])
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Root output dir; raw/ and full/ subdirs are created.")
+    parser.add_argument("--depth_dir", type=str, default=None)
+    parser.add_argument("--texture_sigma", type=float, default=3.0)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Optional seed for reproducible noise.")
     parser.add_argument("--depth_backend", type=str, default="hadepth",
                         choices=["hadepth", "midas", "midas_hybrid",
                                  "depth_anything_v2_hf"],
@@ -405,12 +382,13 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    run_inference(
+    run_compare(
         cfg, args.checkpoint,
         domain=args.domain,
         output_dir=args.output_dir,
         depth_dir=args.depth_dir,
         texture_sigma_base=args.texture_sigma,
+        seed=args.seed,
         depth_backend=args.depth_backend,
         hadepth_repo=args.hadepth_repo,
         hadepth_ckpt=args.hadepth_ckpt,
