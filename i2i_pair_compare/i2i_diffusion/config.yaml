@@ -37,7 +37,7 @@ training:
   sample_every: 5000
   ckpt_every: 5000
   val_every: 5000
-  out_dir: ".../../../../../projects/i2i_diff_hybrid_v1/outputs"
+  out_dir: "../../../../../projects/i2i_diff_hybrid_v1/outputs"
   resume: null
   reset_ema_on_resume: false   # set true to wipe EMA shadow and restart warmup on resume
 
