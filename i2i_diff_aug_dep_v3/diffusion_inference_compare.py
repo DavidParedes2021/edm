@@ -5,9 +5,11 @@ diffusion_inference_compare.py — Save raw vs. post-processed outputs.
 For every input frame, runs the DDIM model exactly once and writes three PNGs:
 
     {output_dir}/{domain}/l_only/{stem}.png
-        Pure model output: the predicted L channel rendered as greyscale via
-        Lab(L, 0, 0) → RGB. No chroma at all. This is the closest possible
-        view of what the diffusion network alone produced.
+        Greyscale view of the predicted L channel, but restricted to the
+        target region: the brightest ~20% of predicted-L pixels for
+        'overexposed' and the darkest ~20% for 'underexposed'. Outside
+        that region the original L is rendered instead, so the change is
+        visible only in the zone the model is meant to affect. No chroma.
 
     {output_dir}/{domain}/raw/{stem}.png
         Raw model L (upsampled) combined with the original A,B chroma.
@@ -46,7 +48,7 @@ import torch
 from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
 from diffusers import DDIMScheduler
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, binary_fill_holes, label as cc_label
 from tqdm import tqdm
 from PIL import Image
 
@@ -164,6 +166,19 @@ def run_compare(
     cm_threshold = float(cm_cfg.get("luma_threshold", 8.0))
     cm_erode = int(cm_cfg.get("erode_iter", 2))
 
+    ll_cfg = cfg.get("l_localize", {}) or {}
+    ll_enable = bool(ll_cfg.get("enable", True))
+    ll_band_low_under  = float(ll_cfg.get("band_low_pct_under", 10.0))
+    ll_band_high_under = float(ll_cfg.get("band_high_pct_under", 30.0))
+    ll_band_low_over   = float(ll_cfg.get("band_low_pct_over",  70.0))
+    ll_band_high_over  = float(ll_cfg.get("band_high_pct_over", 90.0))
+    ll_presmooth_ref   = float(ll_cfg.get("presmooth_ref", 24.0))
+    ll_smooth_ref      = float(ll_cfg.get("smooth_ref", 48.0))
+    ll_largest_only    = bool(ll_cfg.get("largest_only", True))
+    ll_enforce_target  = bool(ll_cfg.get("enforce_target", True))
+    ll_target_L_over   = float(ll_cfg.get("target_L_over", 95.0))
+    ll_target_L_under  = float(ll_cfg.get("target_L_under", 5.0))
+
     af_cfg = cfg.get("analytic_floor", {}) or {}
     af_enable = bool(af_cfg.get("enable", True))
     af_shift_under = float(af_cfg.get("shift_magnitude_under", 85.0))
@@ -267,11 +282,61 @@ def run_compare(
                 dtype=np.float32,
             ).clip(0.0, 100.0)
 
-            # ── L-ONLY branch: model L with zero chroma → greyscale ─────
-            # Lab(L, 0, 0) → RGB gives the perceptually-correct greyscale
-            # view of just the diffusion network's L prediction.
-            zeros = np.zeros_like(L_pred_full, dtype=np.float32)
-            lab_l_only = np.stack([L_pred_full, zeros, zeros], axis=-1)
+            # ── Predicted-L localization weight (shared) ────────────────
+            # Same logic as diffusion_inference.py: pre-smooth predicted L
+            # so the percentile band reflects large-scale structure, build
+            # a smoothstep, optionally keep only the largest connected
+            # blob with holes filled, and apply a final blur for soft
+            # edges. Used by both l_only and full branches.
+            mask_f = mask.astype(np.float32)
+            if ll_enable:
+                presmooth_sigma = max(H_o, W_o) / max(ll_presmooth_ref, 1.0)
+                L_pred_smooth = gaussian_filter(
+                    L_pred_full.astype(np.float32), sigma=presmooth_sigma
+                )
+                L_pool = (L_pred_smooth[mask] if mask.any()
+                          else L_pred_smooth.ravel())
+                if domain == "underexposed":
+                    p_lo = float(np.percentile(L_pool, ll_band_low_under))
+                    p_hi = float(np.percentile(L_pool, ll_band_high_under))
+                    span = max(p_hi - p_lo, 1e-6)
+                    w_loc = np.clip((p_hi - L_pred_smooth) / span, 0.0, 1.0)
+                else:
+                    p_lo = float(np.percentile(L_pool, ll_band_low_over))
+                    p_hi = float(np.percentile(L_pool, ll_band_high_over))
+                    span = max(p_hi - p_lo, 1e-6)
+                    w_loc = np.clip((L_pred_smooth - p_lo) / span, 0.0, 1.0)
+                w_loc = (w_loc * w_loc * (3.0 - 2.0 * w_loc)).astype(np.float32)
+                if ll_largest_only:
+                    binary = (w_loc >= 0.5) & mask
+                    if binary.any():
+                        binary = binary_fill_holes(binary)
+                        labels, n_cc = cc_label(binary)
+                        if n_cc > 0:
+                            sizes = np.bincount(labels.ravel())
+                            sizes[0] = 0
+                            keep = (labels == int(np.argmax(sizes)))
+                            w_loc = w_loc * keep.astype(np.float32)
+                        else:
+                            w_loc[...] = 0.0
+                    else:
+                        w_loc[...] = 0.0
+                w_loc = gaussian_filter(
+                    w_loc, sigma=max(H_o, W_o) / max(ll_smooth_ref, 1.0),
+                )
+            else:
+                w_loc = np.ones((H_o, W_o), dtype=np.float32)
+
+            """
+            # ── L-ONLY branch: model L restricted to the target region ──
+            # Greyscale view that mixes predicted L into the original L
+            # using the shared localization weight (also clamped by the
+            # content mask so dark borders stay black).
+            w_lonly = w_loc * mask_f
+            L_l_only = (w_lonly * L_pred_full
+                        + (1.0 - w_lonly) * l_o).astype(np.float32)
+            zeros = np.zeros_like(L_l_only, dtype=np.float32)
+            lab_l_only = np.stack([L_l_only, zeros, zeros], axis=-1)
             rgb_l_only = lab_to_rgb(lab_l_only)
             Image.fromarray(rgb_l_only).save(str(l_only_dir / f"{stem}.png"))
 
@@ -281,6 +346,7 @@ def run_compare(
             )
             rgb_raw = lab_to_rgb(lab_raw)
             Image.fromarray(rgb_raw).save(str(raw_dir / f"{stem}.png"))
+            """
 
             # ── FULL branch: full diffusion_inference.py pipeline ───────
             L_pp = L_pred_full.copy()
@@ -314,6 +380,29 @@ def run_compare(
             L_model    = np.clip(L_low_pred + hf_gate * L_high,
                                  0.0, 100.0).astype(np.float32)
 
+            # ── In-mask soft level shift (after texture reinjection) ──
+            # Uniform additive shift inside w_loc to bring the mask-core
+            # extreme to the target while preserving the natural variation
+            # and HF detail. Mirrors diffusion_inference.py.
+            if ll_enable and ll_enforce_target:
+                core = w_loc > 0.5
+                if core.any():
+                    L_core = L_model[core]
+                    if domain == "underexposed":
+                        current = float(np.percentile(L_core, 10.0))
+                        needed = current - ll_target_L_under
+                        sign = -1.0
+                    else:
+                        current = float(np.percentile(L_core, 90.0))
+                        needed = ll_target_L_over - current
+                        sign = +1.0
+                    if needed > 0.0:
+                        L_shifted = np.clip(L_model + sign * needed,
+                                            0.0, 100.0)
+                        L_model = (w_loc * L_shifted
+                                   + (1.0 - w_loc) * L_model
+                                   ).astype(np.float32)
+
             if fb_enable:
                 fb_smooth_px = fb_smooth * max(H_o, W_o) / 512.0
                 alpha = focal_blend_alpha(
@@ -333,7 +422,7 @@ def run_compare(
                 )
                 alpha = alpha + (1.0 - alpha) * fb_model_trust * s
 
-            alpha = alpha * mask.astype(np.float32)
+            alpha = alpha * mask_f * w_loc
 
             L_final = (alpha * L_model + (1.0 - alpha) * l_o).astype(np.float32)
             L_final = np.clip(L_final, 0.0, 100.0)
@@ -343,9 +432,9 @@ def run_compare(
                 L_new=L_final, L_orig=l_o, depth=d_o,
                 mode=domain, cfg=chroma_cfg,
             )
-            m_f = mask.astype(np.float32)
-            A_new = m_f * A_att + (1.0 - m_f) * ab[..., 0]
-            B_new = m_f * B_att + (1.0 - m_f) * ab[..., 1]
+            chroma_w = mask_f * w_loc
+            A_new = chroma_w * A_att + (1.0 - chroma_w) * ab[..., 0]
+            B_new = chroma_w * B_att + (1.0 - chroma_w) * ab[..., 1]
 
             lab_full = np.stack([L_final, A_new, B_new], axis=-1)
             rgb_full = lab_to_rgb(lab_full)

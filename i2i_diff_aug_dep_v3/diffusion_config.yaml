@@ -123,22 +123,15 @@ training:
 # --- Losses ---
 losses:
   mse_weight: 1.0
-  l1_weight: 0.5            # was 0.1 — direct x0 supervision now matters
-  edge_weight: 0.05         # was 0.03
-
-  # Min-SNR-γ MSE weighting (Hang et al. 2023). Without this, ε-prediction
-  # MSE at low-t (high SNR) collapses in equivalent x0-loss weight, so the
-  # model has no incentive to commit to the extreme dark/bright targets in
-  # the supervision and instead regresses toward source. γ=5 is the value
-  # the paper tunes to and is robust across tasks. Set to 1e6 to disable.
-  min_snr_gamma: 5.0
+  l1_weight: 0.1
+  edge_weight: 0.03
 
   # Extreme-weighted L1 — single knob; the loss automatically uses
   # mode='dark' if domain='underexposed', mode='bright' if 'overexposed'.
   # Heavily upweights pixels at the target's extreme to crush the
   # mean-regression bias responsible for "barely noticeable" effects.
-  extreme_weight: 2.0       # was 0.5 — dominant now that min-SNR opened low-t
-  extreme_alpha:  5.0
+  extreme_weight: 0.5     # was dark_weight=0.15
+  extreme_alpha:  8.0       # was 3.0
   extreme_tau:    0.3
 
   # Depth-gradient consistency — keeps exposure falloff aligned with geometry.
@@ -188,38 +181,90 @@ content_mask:
   erode_iter:     2     # erode the boundary slightly to avoid edge bleed
 
 # --- Focal blend (force underexposure to stay in deep zones only) ---
-# Was a band-aid for the model leaking the effect onto near tissue when it
-# wasn't depth-aware enough. With min-SNR-γ training the depth-awareness
-# now lives inside the model itself (the supervision targets already
-# encode it), so this depth-driven α blend is redundant. Re-enable as a
-# safety net only if a fresh checkpoint still leaks effect into shallow
-# regions.
+# Even inside the FOV the model can leak the effect onto mid-depth tissue
+# near the light source. A depth-driven blend weight lets the model fully
+# act only in the deepest regions and falls off to the original L
+# elsewhere. alpha(d) = ((farness - knee) / (1 - knee))^gamma in [floor, 1].
+#
+# gamma was lowered (2.5 → 1.6) and knee → 0 so the dark zone covers the
+# whole depth-far half of the FOV instead of collapsing onto a tight ring
+# around the deepest pixel. Combined with `analytic_floor` below, the
+# darkening reaches L≈0 in the cavity AND extends across a believable area.
 focal_blend:
-  enable:       false
+  enable:       true
   gamma:        1.6   # lower = wider effect zone
   knee:         0.0   # no dead-zone — even the slightly-far tissue darkens
   floor:        0.0   # min α; 0 = fully suppress effect on near tissue
   smooth_sigma: 4.0   # gaussian smoothing of α (px at 512px ref)
+  # Model-trust boost on α: where the model's predicted L diverges from
+  # L_orig in the domain's direction, raise α toward 1 regardless of
+  # depth. Fixes "barely darkened" outputs on flat scenes (no clear deep
+  # cavity) where depth alone keeps α≈floor and the original brighter
+  # L wins. Set to 0 to disable; 1 = fully trust the model wherever it
+  # commits to a strong shift. The deep-cavity behavior is unchanged
+  # because α is already 1 there.
+  model_trust:      0.9   # 0..1; weight given to model's strength signal
+  model_strength_L: 80.0   # L-unit delta treated as "full strength"
+
+# --- Predicted-L localization (confine the effect to the target band) ---
+# Confine the effect to one continuous region in the predicted-L extreme
+# (top ~20% for over, bottom ~20% for under). Outside the region we keep
+# the original L AND AB exactly — no cloudy mid-tone bleed.
+#
+# Pipeline:
+#   1. Pre-smooth predicted L (sigma = max(H,W) / presmooth_ref). This is
+#      what stops the mask from becoming a constellation of isolated
+#      stains: the percentile band is computed on a low-passed map, so it
+#      picks up the large-scale bright/dark structure the model committed
+#      to, not per-pixel noise.
+#   2. Smoothstep over the band → soft weight.
+#   3. If `largest_only`, binarize at 0.5 inside the content mask, fill
+#      holes, label connected components, keep ONLY the largest blob.
+#      Guarantees a single continuous region.
+#   4. Final Gaussian blur on the weight (sigma = max(H,W) / smooth_ref)
+#      for soft edges where the region meets untouched pixels.
+l_localize:
+  enable:              true
+  band_low_pct_under:  19.0   # below this percentile → full weight (under)
+  band_high_pct_under: 35.0   # above this percentile → zero weight (under)
+  band_low_pct_over:   70.0   # below this percentile → zero weight (over)
+  band_high_pct_over:  90.0   # above this percentile → full weight (over)
+  presmooth_ref:       24.0   # pre-smooth sigma divisor (lower = heavier blur of L_pred)
+  smooth_ref:          48.0   # final weight-map blur sigma divisor (lower = softer edges)
+  largest_only:        true   # keep only the single largest connected blob
+  # In-mask soft level shift: applied AFTER texture reinjection. We
+  # measure the mask-core 10th (under) / 90th (over) percentile of
+  # L_model and additively shift L_model inside w_loc so that extreme
+  # reaches the target. A uniform shift preserves the natural gradient
+  # and HF detail the texture reinjection just baked in, so the region
+  # reads as part of the scene instead of a flat patch stamped on top.
+  # If the model already commits past the target, the shift is zero —
+  # this is a floor, not a clamp, so strong predictions are never weakened.
+  # Lower target_L_over (e.g. 90) or raise target_L_under (e.g. 10) for a
+  # softer guaranteed effect; set enforce_target: false to disable.
+  enforce_target:      true
+  target_L_over:       95.0
+  target_L_under:      95.0
 
 # --- Analytic floor (definitive strength clamp on the model output) ---
-# Was the regression-to-mean band-aid: clamp the model's L against the
-# analytic depth-aware target so it could only DEEPEN, never weaken. With
-# min-SNR-γ training the model commits to extremes on its own, so this
-# clamp is the dominant reason the old "raw" output was barely darker than
-# source while the "full" output was strong. Disabled so the diffusion
-# model is the source of truth. Re-enable as a mild safety net (with
-# weaker shift_magnitude/core_clip_blend) if a fresh checkpoint under-
-# darkens the deepest cavities.
+# DDPMs trained with MSE/L1 + extreme-weighted L1 still regress toward the
+# conditional mean — the predicted L in the deep cavity ends up around
+# 40–55 instead of the 0–10 the synthetic training targets actually hit.
+# `depth_aware_augment_lab` is the function that produced those targets;
+# we run it at inference with strong parameters and clamp the model's L
+# against it (np.minimum for underexposed, np.maximum for overexposed).
+# The model can only DEEPEN the effect, never weaken it. This is the fix
+# for "looks just grayed instead of dark".
 analytic_floor:
-  enable:                false
-  shift_magnitude_under: 85.0   # max L drop applied in deep cavity
-  shift_magnitude_over:  70.0   # max L lift applied near light source
-  gamma_under:           1.7    # lower = wider underexposure zone
-  gamma_over:            1.5
+  enable:                true
+  shift_magnitude_under: 2.0   # max L drop applied in deep cavity
+  shift_magnitude_over:  80.0   # max L lift applied near light source
+  gamma_under:           2    # lower = wider underexposure zone
+  gamma_over:            5
   core_threshold:        0.5    # influence above which L is forced toward 0/100
-  core_clip_blend:       0.97   # 1.0 → pure black/white in core; 0.0 → no extra pull
+  core_clip_blend:       0.6   # 1.0 → pure black/white in core; 0.0 → no extra pull
   hf_kill:               0.97   # fraction of original HF removed at peak influence
-  smooth_sigma_base:     6.0    # gaussian smoothing of depth mask (px at 512px ref)
+  smooth_sigma_base:     10.0    # gaussian smoothing of depth mask (px at 512px ref)
 
 # --- Inference ---
 inference:
