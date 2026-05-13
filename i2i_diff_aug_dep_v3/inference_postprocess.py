@@ -130,6 +130,53 @@ def clean_depth_with_mask(
     return d
 
 
+def model_trust_boost(
+    L_model: np.ndarray,
+    L_orig: np.ndarray,
+    mode: str,
+    strength_L: float = 25.0,
+    smooth_sigma: float = 0.0,
+) -> np.ndarray:
+    """Per-pixel [0, 1] map of how strongly the model wants to push L
+    in the domain's direction relative to the original.
+
+    Used as an additive boost on the depth-driven `focal_blend_alpha` so
+    that scenes lacking a clear deep cavity (where depth alone keeps
+    α≈floor) still receive the model's distribution when the diffusion
+    output commits to a substantial low-frequency shift.
+
+    The signal is one-sided: only deltas in the domain's direction count.
+    A model that wants to *brighten* in 'underexposed' mode (or vice
+    versa) returns 0 — model_trust never weakens the effect.
+
+    Args:
+        L_model: float32 (H, W) in [0, 100] — model's predicted L
+            (post-analytic-floor, ideally also post-texture-reinjection
+            so HF noise doesn't dominate).
+        L_orig:  float32 (H, W) in [0, 100] — source L.
+        mode:    'underexposed' or 'overexposed'.
+        strength_L: L-unit delta treated as full strength (saturates to 1).
+        smooth_sigma: optional Gaussian smoothing on the strength map (px).
+
+    Returns:
+        float32 (H, W) in [0, 1].
+    """
+    delta = L_model.astype(np.float32) - L_orig.astype(np.float32)
+    if mode == "underexposed":
+        s = np.clip(-delta / max(strength_L, 1e-6), 0.0, 1.0)
+    elif mode == "overexposed":
+        s = np.clip(delta / max(strength_L, 1e-6), 0.0, 1.0)
+    else:
+        raise ValueError(
+            f"mode must be 'underexposed' or 'overexposed', got {mode}"
+        )
+    if smooth_sigma > 0:
+        from scipy.ndimage import gaussian_filter
+        s = gaussian_filter(s, sigma=smooth_sigma)
+        s = np.clip(s, 0.0, 1.0)
+    return s.astype(np.float32)
+
+
 def focal_blend_alpha(
     depth: np.ndarray,
     mode: str,
