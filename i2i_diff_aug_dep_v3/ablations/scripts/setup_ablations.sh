@@ -105,7 +105,14 @@ else
 fi
 
 echo "[3/6] Pair set — $MASK_STRATEGY_NO_DEPTH (NO_DEPTH variant) → $PAIRS_NO_DEPTH"
-if [ ! -d "$PAIRS_NO_DEPTH/normal" ]; then
+# The two pair sets share identical normal/ + depth/ contents (same source RGB,
+# same HADepth output); only the overexposed/ + underexposed/ targets differ.
+# Pre-create symlinks so the generator writes normal/+depth/ straight back to
+# the baseline directory — same bytes, no duplication.
+if [ ! -e "$PAIRS_NO_DEPTH/overexposed" ]; then
+  mkdir -p "$PAIRS_NO_DEPTH"
+  ln -snf "$(realpath "$PAIRS_BASELINE/normal")" "$PAIRS_NO_DEPTH/normal"
+  ln -snf "$(realpath "$PAIRS_BASELINE/depth")"  "$PAIRS_NO_DEPTH/depth"
   python "$PROD/generate_pairs.py" \
     --normal_dir   "$TRAIN_SOURCE_DIR" \
     --depth_dir    "$DEPTH_DIR" \
