@@ -9,11 +9,14 @@
 # don't support those backends.
 #
 # Steps:
+#   0. Deterministic train subset (TRAIN_MAX_IMAGES images, seed=TRAIN_SAMPLE_SEED)
+#      — skipped when TRAIN_MAX_IMAGES=0 (whole NORMAL_TRAIN_DIR is used)
 #   1. Train-set depth cache         (HADepth, one .npy per train image)
 #   2. Both pair sets:
 #        a) hybrid    — for BASELINE / LAB_FULL / loss variants
 #        b) luminance — for the NO_DEPTH variant (pair targets contain NO depth)
 #   3. Deterministic N-image test subset  (default N=200, seed=42)
+#      — excludes anything already in the train subset so train/test stay disjoint
 #   4. Test-subset depth cache
 #   5. Test-subset GT pairs               (for PSNR/SSIM/LPIPS)
 #   6. Per-variant config YAMLs            (12 files)
@@ -59,11 +62,28 @@ common_pair_args=(
   --num_variants "$NUM_VARIANTS"
 )
 
+# ─── Step 0 — train-subset selection ─────────────────────────────────────────
+# Whatever follows operates on $TRAIN_SOURCE_DIR (the subset, or the full
+# NORMAL_TRAIN_DIR if subsampling is disabled).
+if [ "${TRAIN_MAX_IMAGES:-0}" -gt 0 ]; then
+  echo "[0/6] Subsample training set ($TRAIN_MAX_IMAGES images, seed=$TRAIN_SAMPLE_SEED)"
+  python "$SCRIPT_DIR/subsample_test_set.py" \
+    --src "$NORMAL_TRAIN_DIR" \
+    --dst "$TRAIN_NORMAL_SUBSET" \
+    --n "$TRAIN_MAX_IMAGES" \
+    --seed "$TRAIN_SAMPLE_SEED" \
+    2>&1 | tee "$ABL_ROOT/logs/setup_train_subset.log"
+  TRAIN_SOURCE_DIR="$TRAIN_NORMAL_SUBSET"
+else
+  echo "[0/6] TRAIN_MAX_IMAGES=0 — using full $NORMAL_TRAIN_DIR (no train subsampling)"
+  TRAIN_SOURCE_DIR="$NORMAL_TRAIN_DIR"
+fi
+
 echo "[1/6] Training-set depth cache → $DEPTH_DIR  (backend=$DEPTH_BACKEND)"
 if [ ! -d "$DEPTH_DIR" ] || [ -z "$(ls -A "$DEPTH_DIR" 2>/dev/null || true)" ]; then
   python "$PROD/depth_estimator.py" \
     "${depth_args[@]}" \
-    --input_dir "$NORMAL_TRAIN_DIR" \
+    --input_dir "$TRAIN_SOURCE_DIR" \
     --output_dir "$DEPTH_DIR" \
     2>&1 | tee "$ABL_ROOT/logs/setup_depth_train.log"
 else
@@ -73,7 +93,7 @@ fi
 echo "[2/6] Pair set — $MASK_STRATEGY_BASELINE (baseline) → $PAIRS_BASELINE"
 if [ ! -d "$PAIRS_BASELINE/normal" ]; then
   python "$PROD/generate_pairs.py" \
-    --normal_dir   "$NORMAL_TRAIN_DIR" \
+    --normal_dir   "$TRAIN_SOURCE_DIR" \
     --depth_dir    "$DEPTH_DIR" \
     --output_dir   "$PAIRS_BASELINE" \
     --mask_strategy "$MASK_STRATEGY_BASELINE" \
@@ -87,7 +107,7 @@ fi
 echo "[3/6] Pair set — $MASK_STRATEGY_NO_DEPTH (NO_DEPTH variant) → $PAIRS_NO_DEPTH"
 if [ ! -d "$PAIRS_NO_DEPTH/normal" ]; then
   python "$PROD/generate_pairs.py" \
-    --normal_dir   "$NORMAL_TRAIN_DIR" \
+    --normal_dir   "$TRAIN_SOURCE_DIR" \
     --depth_dir    "$DEPTH_DIR" \
     --output_dir   "$PAIRS_NO_DEPTH" \
     --mask_strategy "$MASK_STRATEGY_NO_DEPTH" \
@@ -97,12 +117,13 @@ else
   echo "    [skip] $PAIRS_NO_DEPTH already exists"
 fi
 
-echo "[4/6] Subsample test set ($TEST_MAX_IMAGES images, seed=$TEST_SAMPLE_SEED)"
+echo "[4/6] Subsample test set ($TEST_MAX_IMAGES images, seed=$TEST_SAMPLE_SEED, excluding train subset)"
 python "$SCRIPT_DIR/subsample_test_set.py" \
   --src "$NORMAL_TEST_DIR" \
   --dst "$TEST_NORMAL_SUBSET" \
   --n "$TEST_MAX_IMAGES" \
   --seed "$TEST_SAMPLE_SEED" \
+  --exclude_dir "$TRAIN_SOURCE_DIR" \
   2>&1 | tee "$ABL_ROOT/logs/setup_subset.log"
 
 echo "[5/6] Test-subset depth cache → $DEPTH_TEST_DIR"
