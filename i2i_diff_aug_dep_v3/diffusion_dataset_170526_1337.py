@@ -31,25 +31,13 @@ from exposure_augment import rgb_to_lab
 class PairedLuminanceDataset(Dataset):
     """Single-domain dataset.
 
-    Each item returns (target_mode='l', default):
+    Each item returns:
         source_L : (1, H, W) float32 in [-1, 1]
         target_L : (1, H, W) float32 in [-1, 1]
         depth    : (1, H, W) float32 in [-1, 1]  (rescaled from [0,1])
-
-    When target_mode='lab' (used by the L-vs-RGB ablation):
-        source_LAB : (3, H, W) — L,A,B in [-1, 1]
-        target_LAB : (3, H, W) — target_L + source_A,B (chroma unchanged in the
-                                 synthetic pipeline; the model must learn to
-                                 preserve it)
-        depth      : (1, H, W) — same as above
-
-    LAB normalisation:
-        L ∈ [0, 100]  →  L/50 - 1
-        A,B ∈ [-128, 127]  →  A/128, B/128  (kept in [-1, 1])
     """
 
     _ALLOWED_DOMAINS = ("overexposed", "underexposed")
-    _ALLOWED_TARGET_MODES = ("l", "lab")
 
     def __init__(
         self,
@@ -59,23 +47,16 @@ class PairedLuminanceDataset(Dataset):
         augment: bool = True,
         gamma_jitter: float = 0.1,        # ± range for random gamma on L
         depth_noise_sigma: float = 0.02,  # Gaussian noise on depth (robustness)
-        target_mode: str = "l",           # 'l' or 'lab' — A2 ablation knob
     ):
         if domain not in self._ALLOWED_DOMAINS:
             raise ValueError(
                 f"domain must be one of {self._ALLOWED_DOMAINS}, got {domain!r}"
-            )
-        if target_mode not in self._ALLOWED_TARGET_MODES:
-            raise ValueError(
-                f"target_mode must be one of {self._ALLOWED_TARGET_MODES}, "
-                f"got {target_mode!r}"
             )
         self.domain = domain
         self.image_size = image_size
         self.augment = augment
         self.gamma_jitter = gamma_jitter
         self.depth_noise_sigma = depth_noise_sigma
-        self.target_mode = target_mode
 
         pairs = Path(pairs_dir)
         normal_dir = pairs / "normal"
@@ -117,12 +98,6 @@ class PairedLuminanceDataset(Dataset):
         return (L / 50.0) - 1.0
 
     @staticmethod
-    def _normalise_AB(ab):
-        # rgb_to_lab produces A,B in roughly [-128, 127]; divide by 128
-        # to bring them inside [-1, 1] (small overshoot tolerated).
-        return ab / 128.0
-
-    @staticmethod
     def _normalise_depth(d):
         # [0, 1] → [-1, 1]  to match the UNet input scale
         return d * 2.0 - 1.0
@@ -142,39 +117,29 @@ class PairedLuminanceDataset(Dataset):
 
         normal_lab = np.load(normal_path).astype(np.float32)  # (H, W, 3)
         source_L = normal_lab[..., 0]
-        source_A = normal_lab[..., 1]
-        source_B = normal_lab[..., 2]
 
         target_L = np.load(target_path).astype(np.float32)
         depth = np.load(depth_path).astype(np.float32)
 
         # resize all to model resolution
         source_L = self._resize_2d(source_L, self.image_size)
-        source_A = self._resize_2d(source_A, self.image_size)
-        source_B = self._resize_2d(source_B, self.image_size)
         target_L = self._resize_2d(target_L, self.image_size)
         depth = self._resize_2d(depth, self.image_size)
         depth = np.clip(depth, 0.0, 1.0)  # preserve domain
 
-        # ── joint spatial augmentation (SAME transform on all channels) ──
+        # ── joint spatial augmentation (SAME transform on all three) ──
         if self.augment:
             if random.random() > 0.5:
                 source_L = np.flip(source_L, axis=1).copy()
-                source_A = np.flip(source_A, axis=1).copy()
-                source_B = np.flip(source_B, axis=1).copy()
                 target_L = np.flip(target_L, axis=1).copy()
                 depth    = np.flip(depth,    axis=1).copy()
             if random.random() > 0.5:
                 source_L = np.flip(source_L, axis=0).copy()
-                source_A = np.flip(source_A, axis=0).copy()
-                source_B = np.flip(source_B, axis=0).copy()
                 target_L = np.flip(target_L, axis=0).copy()
                 depth    = np.flip(depth,    axis=0).copy()
             if random.random() > 0.5:
                 k = random.choice([1, 2, 3])
                 source_L = np.rot90(source_L, k).copy()
-                source_A = np.rot90(source_A, k).copy()
-                source_B = np.rot90(source_B, k).copy()
                 target_L = np.rot90(target_L, k).copy()
                 depth    = np.rot90(depth,    k).copy()
 
@@ -194,26 +159,14 @@ class PairedLuminanceDataset(Dataset):
                 depth = np.clip(depth, 0.0, 1.0)
 
         # normalise to [-1, 1]
-        source_L_n = self._normalise_L(source_L)
-        target_L_n = self._normalise_L(target_L)
-        depth_n = self._normalise_depth(depth)
-        depth_tensor = torch.from_numpy(depth_n).unsqueeze(0)
+        source_L = self._normalise_L(source_L)
+        target_L = self._normalise_L(target_L)
+        depth = self._normalise_depth(depth)
 
-        if self.target_mode == "l":
-            source_tensor = torch.from_numpy(source_L_n).unsqueeze(0)
-            target_tensor = torch.from_numpy(target_L_n).unsqueeze(0)
-            return source_tensor, target_tensor, depth_tensor
+        source_tensor = torch.from_numpy(source_L).unsqueeze(0)
+        target_tensor = torch.from_numpy(target_L).unsqueeze(0)
+        depth_tensor = torch.from_numpy(depth).unsqueeze(0)
 
-        # target_mode == "lab"  — concatenate L,A,B as 3-channel tensors.
-        # Target AB == source AB (the synthetic pair pipeline preserves chroma);
-        # the LAB diffusion model must learn to keep AB intact through denoising,
-        # which is the entire point of this ablation.
-        source_A_n = self._normalise_AB(source_A)
-        source_B_n = self._normalise_AB(source_B)
-        source_lab = np.stack([source_L_n, source_A_n, source_B_n], axis=0)  # (3,H,W)
-        target_lab = np.stack([target_L_n, source_A_n, source_B_n], axis=0)
-        source_tensor = torch.from_numpy(source_lab)
-        target_tensor = torch.from_numpy(target_lab)
         return source_tensor, target_tensor, depth_tensor
 
 
