@@ -291,31 +291,11 @@ class DepthFiLMUNet(nn.Module):
         return out
 
 
-def _channel_counts(cfg: dict) -> tuple:
-    """Compute (in_channels, out_channels) from the ablation toggles.
-
-    use_depth=True / target_mode='l'   →  in=3, out=1   (baseline)
-    use_depth=False / target_mode='l'  →  in=2, out=1   (A1: no-depth)
-    use_depth=True / target_mode='lab' →  in=7, out=3   (A2: LAB-full)
-    use_depth=False / target_mode='lab'→  in=6, out=3
-    """
-    use_depth = bool(cfg["model"].get("use_depth", True))
-    target_mode = str(cfg["model"].get("target_mode", "l")).lower()
-    tch = 1 if target_mode == "l" else 3
-    in_ch = 2 * tch + (1 if use_depth else 0)
-    return in_ch, tch
-
-
 def build_model(cfg: dict, device: torch.device):
-    in_ch, out_ch = _channel_counts(cfg)
-    # Channels are derived from the ablation toggles; any value in the config
-    # is treated as advisory and overridden so that the model shape matches
-    # the dataset/training-loop expectations exactly.
-    print(f"[Model] in_channels={in_ch} out_channels={out_ch}")
     unet_kwargs = dict(
         sample_size=cfg["image"]["size"],
-        in_channels=in_ch,
-        out_channels=out_ch,
+        in_channels=cfg["model"]["in_channels"],    # 3: noisy_L + source_L + depth
+        out_channels=cfg["model"]["out_channels"],  # 1
         block_out_channels=tuple(cfg["model"]["block_out_channels"]),
         layers_per_block=cfg["model"]["layers_per_block"],
         down_block_types=tuple(cfg["model"]["down_block_types"]),
@@ -562,15 +542,6 @@ def train(cfg: dict, resume_path: str = None,
         wandb.init(project=cfg["logging"]["wandb_project"],
                    entity=cfg["logging"].get("wandb_entity"), config=cfg)
 
-    # ── ablation toggles (also drive UNet shape & loss inclusion) ─────────
-    use_depth = bool(cfg["model"].get("use_depth", True))
-    target_mode = str(cfg["model"].get("target_mode", "l")).lower()
-    if target_mode not in ("l", "lab"):
-        raise ValueError(
-            f"model.target_mode must be 'l' or 'lab', got {target_mode!r}"
-        )
-    print(f"[Ablation] use_depth={use_depth}  target_mode={target_mode}")
-
     # ── datasets ───────────────────────────────────────────────────────────
     train_ds = PairedLuminanceDataset(
         pairs_dir=cfg["data"]["pairs_dir"],
@@ -579,7 +550,6 @@ def train(cfg: dict, resume_path: str = None,
         augment=True,
         gamma_jitter=cfg["training"].get("gamma_jitter", 0.1),
         depth_noise_sigma=cfg["training"].get("depth_noise_sigma", 0.02),
-        target_mode=target_mode,
     )
     train_loader = DataLoader(
         train_ds,
@@ -589,21 +559,12 @@ def train(cfg: dict, resume_path: str = None,
         pin_memory=True,
         drop_last=True,
     )
-    # In-training visual samples need a NormalInferenceDataset, which lazy-loads
-    # HADepth on the first depth-cache miss. For ablation runs we never invoke
-    # the sampler (disable_samples + non-default channel configs), so building
-    # the dataset just to hit a HADepth path issue is pure waste — skip it.
-    if cfg["training"].get("disable_samples", False) or not use_depth or target_mode != "l":
-        normal_loader = None
-        print("[Train] in-training visual samples disabled — "
-              "skipping NormalInferenceDataset construction.")
-    else:
-        normal_ds = NormalInferenceDataset(
-            normal_dir=cfg["data"]["normal_dir"],
-            image_size=cfg["image"]["size"],
-            depth_dir=cfg["data"].get("depth_dir"),
-        )
-        normal_loader = DataLoader(normal_ds, batch_size=1, shuffle=True, num_workers=0)
+    normal_ds = NormalInferenceDataset(
+        normal_dir=cfg["data"]["normal_dir"],
+        image_size=cfg["image"]["size"],
+        depth_dir=cfg["data"].get("depth_dir"),
+    )
+    normal_loader = DataLoader(normal_ds, batch_size=1, shuffle=True, num_workers=0)
 
     # ── model ─────────────────────────────────────────────────────────────
     model = build_model(cfg, device)
@@ -682,6 +643,12 @@ def train(cfg: dict, resume_path: str = None,
         "aux_max_t_frac", 0.5
     ) * cfg["diffusion"]["num_train_timesteps"])
 
+    # Min-SNR-γ MSE weighting (Hang et al., 2023). Without this the model
+    # regresses to the conditional mean and outputs a slightly-dimmed source
+    # — which is exactly what the raw inference outputs were doing. Set γ to
+    # a large value (e.g. 1e6) to disable for a legacy comparison run.
+    min_snr_gamma = float(cfg["losses"].get("min_snr_gamma", 5.0))
+
     # Pre-cached cumulative-alpha tensor (fp32, on device) for the x0 math
     alphas_cumprod_fp32 = noise_scheduler.alphas_cumprod.to(
         device=device, dtype=torch.float32
@@ -699,34 +666,38 @@ def train(cfg: dict, resume_path: str = None,
         n_batches = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
-        for step, (source_x, target_x, depth) in enumerate(pbar):
-            # In target_mode='l', source_x/target_x are (B,1,H,W) on the L
-            # channel. In target_mode='lab' they are (B,3,H,W) with [L,A,B].
-            source_x = source_x.to(device)
-            target_x = target_x.to(device)
+        for step, (source_L, target_L, depth) in enumerate(pbar):
+            source_L = source_L.to(device)
+            target_L = target_L.to(device)
             depth = depth.to(device)
 
-            noise = torch.randn_like(target_x)
-            B = target_x.shape[0]
+            noise = torch.randn_like(target_L)
+            B = target_L.shape[0]
             timesteps = torch.randint(
                 0, noise_scheduler.config.num_train_timesteps, (B,), device=device
             ).long()
-            noisy_target = noise_scheduler.add_noise(target_x, noise, timesteps)
+            noisy_target = noise_scheduler.add_noise(target_L, noise, timesteps)
 
-            # Build model input. Channels:
-            #   noisy target  ── always
-            #   clean source  ── always (image-to-image conditioning)
-            #   depth         ── only if use_depth=True
-            if use_depth:
-                model_input = torch.cat([noisy_target, source_x, depth], dim=1)
-            else:
-                model_input = torch.cat([noisy_target, source_x], dim=1)
+            # 3-channel input — no class labels, single-domain training.
+            model_input = torch.cat([noisy_target, source_L, depth], dim=1)
 
             with autocast(enabled=cfg["training"]["mixed_precision"]):
                 pred_noise = model(model_input, timesteps,
                                    class_labels=None).sample
-                loss_mse = F.mse_loss(pred_noise, noise)
-                total = mse_w * loss_mse
+
+            # Min-SNR-γ weighted MSE in fp32 (outside autocast).
+            # SNR(t) = ᾱ(t) / (1 - ᾱ(t)). Uniform per-t MSE on ε is equivalent
+            # to a SNR(t)-weighted MSE on x0 — collapsing the gradient signal
+            # at low-t (high SNR), the regime where the model must commit to
+            # extreme dark/bright targets. Capping the effective x0 weight at
+            # γ rebalances the per-timestep contribution.
+            with torch.no_grad():
+                a_bar_t = alphas_cumprod_fp32[timesteps].clamp(1e-4, 1.0 - 1e-7)
+                snr = a_bar_t / (1.0 - a_bar_t)
+                w_t = (snr.clamp(max=min_snr_gamma) / snr).view(-1, 1, 1, 1)
+            mse_per = (pred_noise.float() - noise.float()).pow(2)
+            loss_mse = (w_t * mse_per).mean()
+            total = mse_w * loss_mse
 
             # ── x0-estimate path (fp32, OUTSIDE autocast) ──────────────────
             # This is the previous NaN source: at high t, alpha_cumprod -> 0,
@@ -739,15 +710,11 @@ def train(cfg: dict, resume_path: str = None,
 
             parts_this_step = {"mse": float(loss_mse.detach())}
 
-            # In no-depth mode the DG loss is structurally undefined, force off
-            # regardless of the config to keep the ablation contracts clean.
-            dg_w_eff = dg_w if use_depth else 0.0
-
-            if n_aux > 0 and (l1_w + edge_w + extreme_w + dg_w_eff) > 0:
+            if n_aux > 0 and (l1_w + edge_w + extreme_w + dg_w) > 0:
                 pred_noise_f = pred_noise.float()
                 noisy_target_f = noisy_target.float()
-                target_f = target_x.float()
-                source_f = source_x.float()
+                target_L_f = target_L.float()
+                source_L_f = source_L.float()
                 depth_f = depth.float()
 
                 a_bar = alphas_cumprod_fp32[timesteps].view(-1, 1, 1, 1)
@@ -763,44 +730,39 @@ def train(cfg: dict, resume_path: str = None,
                 # Select only the subset of the batch that passes the SNR gate
                 sel = aux_mask
                 x0_s   = x0_hat[sel]
-                tgt_s  = target_f[sel]
-                src_s  = source_f[sel]
+                tgt_s  = target_L_f[sel]
+                src_s  = source_L_f[sel]
                 dep_s  = depth_f[sel]
-                # The pixel-extreme / edge / depth-gradient losses are
-                # defined on the L channel only (extreme = darkness/brightness
-                # of luminance; DG = exposure-shift vs depth geometry). In
-                # LAB-target mode L is channel 0 of the 3-channel tensors.
-                x0_L = x0_s[:, 0:1]
-                tgt_L = tgt_s[:, 0:1]
-                src_L = src_s[:, 0:1]
 
                 aux_total = 0.0
 
                 if l1_w > 0:
-                    # Apply L1 across all output channels (so LAB-mode pays
-                    # for AB drift) — this is what the A2 ablation measures.
                     l_l1 = F.l1_loss(x0_s, tgt_s)
                     aux_total = aux_total + l1_w * l_l1
                     parts_this_step["l1"] = float(l_l1.detach())
 
                 if edge_w > 0:
-                    l_edge = edge_loss_fn(x0_L, tgt_L)
+                    l_edge = edge_loss_fn(x0_s, tgt_s)
                     aux_total = aux_total + edge_w * l_edge
                     parts_this_step["edge"] = float(l_edge.detach())
 
                 if extreme_w > 0:
-                    l_ext = extreme_loss_fn(x0_L, tgt_L)
+                    l_ext = extreme_loss_fn(x0_s, tgt_s)
                     aux_total = aux_total + extreme_w * l_ext
                     parts_this_step[extreme_key] = float(l_ext.detach())
 
-                if dg_w_eff > 0:
-                    l_dg = dgrad_loss_fn(x0_L, src_L, dep_s)
-                    aux_total = aux_total + dg_w_eff * l_dg
+                if dg_w > 0:
+                    l_dg = dgrad_loss_fn(x0_s, src_s, dep_s)
+                    aux_total = aux_total + dg_w * l_dg
                     parts_this_step["dg"] = float(l_dg.detach())
 
-                # Scale aux by fraction of batch that passed the gate so its
-                # contribution is stable as the SNR-gate selectivity varies.
-                total = total + aux_total * (n_aux / B)
+                # Don't dilute by selectivity. The aux losses are already
+                # gated to a useful timestep range; further down-scaling by
+                # `n_aux/B` made the extreme-weighted L1 invisible against
+                # MSE and was a contributor to the regression-to-mean
+                # behaviour (the model effectively saw aux losses worth
+                # ~0.4× MSE instead of the configured ~0.7×).
+                total = total + aux_total
 
             loss = total / grad_accum
 
@@ -864,17 +826,8 @@ def train(cfg: dict, resume_path: str = None,
             torch.save(ck, str(ckpt_dir / "best.pt"))
             print(f"  → best model saved (loss={best_loss:.5f})")
 
-        # periodic samples — only when running the baseline (L-only + depth)
-        # configuration, since the post-processing in generate_samples assumes
-        # that pipeline. Set `training.disable_samples: true` (auto in ablation
-        # configs) to skip; quantitative metrics come from evaluate_ablations.py.
-        samples_enabled = (
-            (epoch + 1) % cfg["training"]["save_every_n_epochs"] == 0
-            and not cfg["training"].get("disable_samples", False)
-            and use_depth
-            and target_mode == "l"
-        )
-        if samples_enabled:
+        # periodic samples
+        if (epoch + 1) % cfg["training"]["save_every_n_epochs"] == 0:
             orig_sd = copy.deepcopy(model.state_dict())
             ema.apply(model)
             generate_samples(
