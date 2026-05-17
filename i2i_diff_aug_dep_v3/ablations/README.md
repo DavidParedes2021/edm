@@ -8,8 +8,6 @@ directions** (`underexposed`, `overexposed`):
 | — | `BASELINE` | Full pipeline (`mask_strategy=hybrid` pairs, depth in UNet + losses + post-proc) |
 | **A1 Depth** | `NO_DEPTH` | `mask_strategy=luminance` pairs (no depth in targets), `in_channels=2`, depth-grad loss off, focal-blend off, depth-chroma boost off |
 | **A2 L-vs-LAB** | `LAB_FULL` | Diffusion learns full LAB (`in_channels=7`, `out_channels=3`) — AB no longer trivially preserved from source |
-| **A3 Loss** | `MSE_ONLY` | `l1=edge=extreme=dg=0` |
-| **A3 Loss** | `NO_L1` | `l1_weight=0` |
 | **A3 Loss** | `NO_SOBEL` | `edge_weight=0` |
 
 The depth signal lives in TWO places in production: (1) the pair-generation
@@ -88,13 +86,51 @@ cat ablations/RESULTS.md
 ABLATION_ENV=/path/to/custom.env bash ablations/scripts/setup_ablations.sh
 ```
 
-### Test-set subsampling
-`NORMAL_TEST_DIR` typically has thousands of frames; scoring all of them per
-ablation is wasteful and slow. `setup_ablations.sh` copies
-`TEST_MAX_IMAGES` frames (default 200) into `TEST_NORMAL_SUBSET` using
-`random.sample` with `TEST_SAMPLE_SEED` so every evaluator sees the same
-subset. Bump `TEST_MAX_IMAGES` if you need tighter FID/KID estimates
-(≥ 200 frames is recommended; below that KID is more reliable than FID).
+### Disk-space management
+
+Pair sets store the full LAB array per frame at native resolution
+(float32 = ~50 MB/image at 4 MP). With `TRAIN_MAX_IMAGES=200` that's roughly
+10–12 GB per pair set. Two mitigations are wired in:
+
+1. **Symlink dedup.** `pairs_baseline/normal` and `pairs_baseline/depth` are
+   identical to `pairs_no_depth/normal` and `pairs_no_depth/depth` — same
+   source RGB, same HADepth output. `setup_ablations.sh` symlinks them so
+   only one copy lives on disk. Only the per-strategy `overexposed/` and
+   `underexposed/` target dirs are duplicated.
+
+2. **Post-training cleanup.** Once every variant's `best.pt` exists, the
+   training pair sets are no longer needed (eval only reads `test_pairs/` and
+   `depth_test/`). Run:
+
+   ```bash
+   bash ablations/scripts/cleanup_train_pairs.sh
+   ```
+
+   This refuses to delete unless all 12 best.pts are on disk; pass `--force`
+   to override (e.g. if you abandoned some variants).
+
+   ```text
+   setup → train → cleanup_train_pairs → eval
+   ```
+
+   Recommended order if you're tight on space.
+
+### Train- and test-set subsampling
+Both the training and the evaluation sets are subsampled by `setup_ablations.sh`
+so 12 trainings × 150 epochs stays tractable.
+
+| Env var | Default | What it does |
+|---|---|---|
+| `TRAIN_MAX_IMAGES` | 200 | N frames copied from `NORMAL_TRAIN_DIR` into `TRAIN_NORMAL_SUBSET`; HADepth + pair generation operate on this subset. Set to 0 to use the full folder. |
+| `TRAIN_SAMPLE_SEED` | 1 | Deterministic seed for the train subset. |
+| `TEST_MAX_IMAGES` | 200 | N frames copied from `NORMAL_TEST_DIR` into `TEST_NORMAL_SUBSET`; this is what every evaluator scores. |
+| `TEST_SAMPLE_SEED` | 42 | Deterministic seed for the test subset. |
+
+The test subsampler always passes `--exclude_dir $TRAIN_NORMAL_SUBSET`, so
+train/test stay disjoint even when `NORMAL_TRAIN_DIR == NORMAL_TEST_DIR`.
+
+Bump `TEST_MAX_IMAGES` if you need tighter FID/KID estimates (≥ 200 frames
+recommended; below that, trust KID more than FID).
 
 ## Output layout
 

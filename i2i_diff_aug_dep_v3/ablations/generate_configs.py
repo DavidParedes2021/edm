@@ -54,18 +54,6 @@ def _v_lab_full(cfg):
     cfg["model"]["target_mode"] = "lab"
 
 
-def _v_mse_only(cfg):
-    # A3 — only the base diffusion loss; ablate every auxiliary term.
-    cfg["losses"]["l1_weight"] = 0.0
-    cfg["losses"]["edge_weight"] = 0.0
-    cfg["losses"]["extreme_weight"] = 0.0
-    cfg["losses"]["depth_grad_weight"] = 0.0
-
-
-def _v_no_l1(cfg):
-    cfg["losses"]["l1_weight"] = 0.0
-
-
 def _v_no_sobel(cfg):
     cfg["losses"]["edge_weight"] = 0.0
 
@@ -74,8 +62,6 @@ VARIANTS = {
     "BASELINE": _v_baseline,
     "NO_DEPTH": _v_no_depth,
     "LAB_FULL": _v_lab_full,
-    "MSE_ONLY": _v_mse_only,
-    "NO_L1":    _v_no_l1,
     "NO_SOBEL": _v_no_sobel,
 }
 

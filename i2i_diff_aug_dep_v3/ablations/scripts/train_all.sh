@@ -15,7 +15,7 @@ fi
 echo "[env] sourcing $ENV_FILE"
 set -a; . "$ENV_FILE"; set +a
 
-VARIANTS=(BASELINE NO_DEPTH LAB_FULL MSE_ONLY NO_L1 NO_SOBEL)
+VARIANTS=(BASELINE NO_DEPTH LAB_FULL NO_SOBEL)
 DOMAINS=(under over)
 
 mkdir -p "$ABL_ROOT/logs"

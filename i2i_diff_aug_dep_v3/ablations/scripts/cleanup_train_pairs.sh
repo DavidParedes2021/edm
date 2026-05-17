@@ -26,11 +26,14 @@ set -a; . "$ENV_FILE"; set +a
 FORCE=0
 [ "${1:-}" = "--force" ] && FORCE=1
 
-VARIANTS=(BASELINE NO_DEPTH LAB_FULL MSE_ONLY NO_L1 NO_SOBEL)
+VARIANTS=(BASELINE NO_DEPTH LAB_FULL NO_SOBEL)
 DOMAINS=(under over)
 
 missing=()
 for domain in "${DOMAINS[@]}"; do
+  # Honour ONLY_DOMAIN so the safety check doesn't insist on a direction the
+  # user explicitly skipped (e.g. ONLY_DOMAIN=over while under is deferred).
+  [ -n "${ONLY_DOMAIN:-}" ] && [ "$domain" != "$ONLY_DOMAIN" ] && continue
   if [ "$domain" = "under" ]; then domain_long="underexposed"; else domain_long="overexposed"; fi
   for v in "${VARIANTS[@]}"; do
     ckpt="$ABL_ROOT/$domain/$v/checkpoints/$domain_long/best.pt"

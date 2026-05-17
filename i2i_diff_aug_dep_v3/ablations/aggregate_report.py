@@ -34,8 +34,7 @@ METRIC_ORDER = [
     ("sobel_l1_mean",          "Sobel↓"),
 ]
 
-VARIANT_ORDER = ["BASELINE", "NO_DEPTH", "LAB_FULL",
-                 "MSE_ONLY", "NO_L1", "NO_SOBEL"]
+VARIANT_ORDER = ["BASELINE", "NO_DEPTH", "LAB_FULL", "NO_SOBEL"]
 
 
 def collect(root: Path) -> dict:
