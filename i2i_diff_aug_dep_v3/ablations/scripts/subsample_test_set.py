@@ -21,6 +21,11 @@ def main():
     ap.add_argument("--dst", required=True)
     ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--exclude_dir", default=None,
+                    help="Optional. Skip any --src image whose basename "
+                         "already exists in this directory. Used to keep "
+                         "train/test subsets disjoint when both point at "
+                         "the same source folder.")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -36,6 +41,18 @@ def main():
     files = sorted(set(files))  # de-dup case-insensitive matches on Windows
     if not files:
         raise SystemExit(f"No images found in {src}")
+
+    if args.exclude_dir:
+        ex = Path(args.exclude_dir)
+        if ex.is_dir():
+            excluded = {p.name for ext in EXTS
+                        for p in (list(ex.glob(f"*{ext}")) + list(ex.glob(f"*{ext.upper()}")))}
+            before = len(files)
+            files = [f for f in files if f.name not in excluded]
+            print(f"[exclude] dropped {before - len(files)} files already in {ex}")
+
+    if not files:
+        raise SystemExit(f"All --src files excluded; nothing to sample.")
 
     n = min(args.n, len(files))
     rng = random.Random(args.seed)
