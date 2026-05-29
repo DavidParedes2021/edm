@@ -40,7 +40,7 @@ for domain in "${DOMAINS[@]}"; do
   for v in "${VARIANTS[@]}"; do
     [ -n "${ONLY_VARIANT:-}" ] && [ "$v" != "$ONLY_VARIANT" ] && continue
     cfg="ablations/configs/$domain/${v,,}.yaml"
-    ckpt="../../outputs/ablations/$domain/$v/checkpoints/$domain_long/best.pt"
+    ckpt="./outputs/ablations/$domain/$v/checkpoints/$domain_long/best.pt"
     out="$ABL_ROOT/$domain/$v/eval"
     log="$ABL_ROOT/logs/eval_${domain}_${v}.log"
     if [ ! -f "$ckpt" ]; then
