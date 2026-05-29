@@ -278,9 +278,15 @@ def _inception_model():
     if _INCEPTION is not None:
         return _INCEPTION
     import torch
-    from torchvision.models import inception_v3, Inception_V3_Weights
-    weights = Inception_V3_Weights.IMAGENET1K_V1
-    net = inception_v3(weights=weights, aux_logits=True)
+    from torchvision.models import inception_v3
+    try:
+        # torchvision >= 0.13: enum-based weights API
+        from torchvision.models import Inception_V3_Weights
+        net = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1,
+                           aux_logits=True)
+    except ImportError:
+        # torchvision < 0.13: legacy pretrained flag
+        net = inception_v3(pretrained=True, aux_logits=True)
     net.fc = torch.nn.Identity()
     net.eval()
     _INCEPTION = net.to(_device())
