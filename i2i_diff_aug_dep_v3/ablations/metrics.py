@@ -307,10 +307,16 @@ def _inception_features(images: Iterable[np.ndarray],
     def _flush():
         if not buf:
             return
-        x = np.stack(buf, axis=0).astype(np.float32) / 255.0  # NHWC [0,1]
-        x = torch.from_numpy(x).permute(0, 3, 1, 2).to(dev)   # NCHW
-        x = F.interpolate(x, size=(299, 299), mode="bilinear",
-                          align_corners=False, antialias=True)
+        # Images may have different resolutions, so resize each to 299x299
+        # individually before batching (Inception's input size anyway).
+        chw = []
+        for img in buf:
+            t = torch.from_numpy(img.astype(np.float32) / 255.0)  # HWC [0,1]
+            t = t.permute(2, 0, 1).unsqueeze(0).to(dev)           # 1CHW
+            t = F.interpolate(t, size=(299, 299), mode="bilinear",
+                              align_corners=False, antialias=True)
+            chw.append(t)
+        x = torch.cat(chw, dim=0)                                  # NCHW
         # Inception normalisation: ImageNet mean/std
         mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
         std  = torch.tensor([0.229, 0.224, 0.225], device=dev).view(1, 3, 1, 1)
