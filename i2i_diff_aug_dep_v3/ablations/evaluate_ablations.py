@@ -194,11 +194,25 @@ def build_test_list(test_normal_dir: str, test_pairs_dir: str | None,
 
 def per_image_metrics(out: dict, gt_L: np.ndarray | None,
                       depth_full: np.ndarray | None,
-                      domain: str) -> dict:
+                      domain: str,
+                      rgb_src: np.ndarray | None = None) -> dict:
     """Compute every metric we can given what's available for this image."""
     r = {}
     L_src = out["L_src"]
     L_out = out["L_out"]
+
+    # Source-referenced preservation (matches compute_paired_metrics.py):
+    # SSIM/PSNR between the generated exposed frame and the original normal
+    # frame. High = the exposure edit preserved texture/structure. This is the
+    # *opposite* reference from psnr_L/ssim_L below (which compare to the GT
+    # target); a structure-preserving edit scores high here and modestly there.
+    if rgb_src is not None:
+        pred_rgb = out["rgb_out"]
+        if pred_rgb.shape[:2] != rgb_src.shape[:2]:
+            pred_rgb = np.array(Image.fromarray(pred_rgb).resize(
+                (rgb_src.shape[1], rgb_src.shape[0]), Image.LANCZOS))
+        r["ssim_src"] = M.ssim_rgb(pred_rgb, rgb_src, data_range=255.0)
+        r["psnr_src"] = M.psnr(pred_rgb, rgb_src, data_range=255.0)
 
     # Reference-based (need GT)
     if gt_L is not None:
@@ -341,7 +355,7 @@ def main():
                 gt_L = np.load(it["gt_L"]).astype(np.float32)
                 gt_L = _resize_arr(gt_L, rgb.shape[:2])  # align resolutions
 
-            r = per_image_metrics(out, gt_L, depth_full, domain)
+            r = per_image_metrics(out, gt_L, depth_full, domain, rgb_src=rgb)
             r["stem"] = it["stem"]
             fp.write(json.dumps(r) + "\n")
             rows.append(r)
@@ -356,7 +370,8 @@ def main():
         "n_with_gt": sum(1 for r in rows if "psnr_L" in r),
         "n_with_depth": sum(1 for r in rows if "depth_mask_pearson" in r),
     }
-    metric_keys = ["psnr_L", "ssim_L", "lpips_rgb",
+    metric_keys = ["ssim_src", "psnr_src",
+                   "psnr_L", "ssim_L", "lpips_rgb",
                    "delta_L_mask", "depth_mask_pearson",
                    "delta_E00_AB", "hf_pearson", "sobel_l1"]
     for k in metric_keys:

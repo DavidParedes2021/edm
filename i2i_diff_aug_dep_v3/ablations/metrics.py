@@ -92,6 +92,25 @@ def ssim(pred: np.ndarray, target: np.ndarray, data_range: float = 100.0) -> flo
         return _ssim_numpy(pred, target, data_range)
 
 
+def ssim_rgb(pred_rgb: np.ndarray, target_rgb: np.ndarray,
+             data_range: float = 255.0) -> float:
+    """SSIM on an RGB image (multichannel, channel_axis=-1).
+
+    Mirrors compute_paired_metrics.py exactly: scikit-image structural_similarity
+    with channel_axis=-1 and data_range=255. Used for the source-referenced
+    'how well is texture/structure preserved through the exposure edit?' metric.
+    Falls back to a per-channel NumPy SSIM if scikit-image is unavailable.
+    """
+    try:
+        from skimage.metrics import structural_similarity as sk_ssim
+        return float(sk_ssim(pred_rgb, target_rgb, channel_axis=-1,
+                             data_range=data_range))
+    except ImportError:
+        vals = [_ssim_numpy(pred_rgb[..., c], target_rgb[..., c], data_range)
+                for c in range(pred_rgb.shape[-1])]
+        return float(np.mean(vals))
+
+
 def _ssim_numpy(pred, target, data_range=100.0, win=11, k1=0.01, k2=0.03):
     p = pred.astype(np.float64)
     t = target.astype(np.float64)

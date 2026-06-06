@@ -22,6 +22,8 @@ from pathlib import Path
 
 # Order shown in the report — also picks which columns the markdown shows.
 METRIC_ORDER = [
+    ("ssim_src_mean",          "SSIM_src↑"),
+    ("psnr_src_mean",          "PSNR_src↑"),
     ("psnr_L_mean",            "PSNR↑"),
     ("ssim_L_mean",            "SSIM↑"),
     ("lpips_rgb_mean",         "LPIPS↓"),
