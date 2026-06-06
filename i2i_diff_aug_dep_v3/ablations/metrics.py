@@ -111,6 +111,30 @@ def ssim_rgb(pred_rgb: np.ndarray, target_rgb: np.ndarray,
         return float(np.mean(vals))
 
 
+def extreme_fraction(L: np.ndarray, dark_below: float = 5.0,
+                     bright_above: float = 95.0) -> tuple:
+    """Fraction of pixels crushed to near-black / blown to near-white.
+
+    Returns (black_frac, bright_frac) on an L map in [0, 100]. High black_frac
+    in 'underexposed' (or bright_frac in 'overexposed') flags an over-aggressive
+    result that looks unnatural and is hard to reproduce — the failure mode the
+    target-visualizer surfaced for the under BASELINE.
+    """
+    Lf = L.astype(np.float32)
+    n = float(Lf.size)
+    return float((Lf < dark_below).sum() / n), float((Lf > bright_above).sum() / n)
+
+
+def mean_delta_L(L_src: np.ndarray, L_out: np.ndarray) -> float:
+    """Mean signed luminance change (L_out - L_src) over the whole frame.
+
+    Negative = net darkening (expected for 'underexposed'), positive = net
+    brightening. Effect *direction/strength*, complementary to delta_L_mask
+    which is restricted to the depth-expected region.
+    """
+    return float(np.mean(L_out.astype(np.float64) - L_src.astype(np.float64)))
+
+
 def _ssim_numpy(pred, target, data_range=100.0, win=11, k1=0.01, k2=0.03):
     p = pred.astype(np.float64)
     t = target.astype(np.float64)

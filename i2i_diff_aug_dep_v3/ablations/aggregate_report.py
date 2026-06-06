@@ -34,6 +34,16 @@ METRIC_ORDER = [
     ("delta_E00_AB_mean",      "ΔE_AB↓"),
     ("hf_pearson_mean",        "HF-r↑"),
     ("sobel_l1_mean",          "Sobel↓"),
+    ("black_frac_mean",        "Black%"),
+    ("mean_delta_L_mean",      "meanΔL"),
+    # ── post-processed (production pipeline; BASELINE / NO_SOBEL only) ──
+    ("ssim_src_pp_mean",       "SSIMsrc_pp↑"),
+    ("psnr_src_pp_mean",       "PSNRsrc_pp↑"),
+    ("ssim_L_pp_mean",         "SSIM_pp↑"),
+    ("lpips_pp_mean",          "LPIPS_pp↓"),
+    ("fid_pp",                 "FID_pp↓"),
+    ("kid_pp",                 "KID_pp↓"),
+    ("black_frac_pp_mean",     "Black%_pp"),
 ]
 
 VARIANT_ORDER = ["BASELINE", "NO_DEPTH", "LAB_FULL", "NO_SOBEL"]

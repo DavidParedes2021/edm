@@ -247,6 +247,12 @@ def per_image_metrics(out: dict, gt_L: np.ndarray | None,
     r["hf_pearson"] = M.hf_pearson(L_src, L_out, sigma=3.0)
     r["sobel_l1"] = M.sobel_l1(L_src, L_out)
 
+    # Effect strength / over-aggression (all variants)
+    black_frac, bright_frac = M.extreme_fraction(L_out)
+    r["black_frac"] = black_frac
+    r["bright_frac"] = bright_frac
+    r["mean_delta_L"] = M.mean_delta_L(L_src, L_out)
+
     return r
 
 
@@ -373,7 +379,8 @@ def main():
     metric_keys = ["ssim_src", "psnr_src",
                    "psnr_L", "ssim_L", "lpips_rgb",
                    "delta_L_mask", "depth_mask_pearson",
-                   "delta_E00_AB", "hf_pearson", "sobel_l1"]
+                   "delta_E00_AB", "hf_pearson", "sobel_l1",
+                   "black_frac", "bright_frac", "mean_delta_L"]
     for k in metric_keys:
         vals = [r[k] for r in rows if k in r and not (isinstance(r[k], float)
                                                       and (np.isnan(r[k]) or np.isinf(r[k])))]

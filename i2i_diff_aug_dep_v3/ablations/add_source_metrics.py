@@ -40,6 +40,21 @@ except ImportError:       # ...and as `python ablations/add_source_metrics.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from ablations import metrics as M
 
+# Prefer the pipeline's exact L (LAB) for the luminance-based metrics; fall back
+# to Rec.709 luma if exposure_augment isn't importable (keeps this script
+# dependency-light and runnable from anywhere).
+try:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from exposure_augment import rgb_to_lab as _rgb_to_lab
+
+    def _L_of(rgb):
+        return _rgb_to_lab(rgb)[..., 0].astype(np.float32)
+except Exception:
+    def _L_of(rgb):
+        Y = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+        return (Y.astype(np.float32) / 255.0) * 100.0
+
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 VARIANT_ORDER = ["BASELINE", "NO_DEPTH", "LAB_FULL", "NO_SOBEL"]
 
@@ -65,18 +80,26 @@ def score_variant(gen_dir: Path, normal_idx: dict) -> dict | None:
     stems = sorted(set(gen_idx) & set(normal_idx))
     if not stems:
         return None
-    ssims, psnrs = [], []
+    ssims, psnrs, blacks, brights, dls = [], [], [], [], []
     for s in stems:
         ref = load_rgb(normal_idx[s])                       # normal source
         gen = load_rgb(gen_idx[s], target_hw=ref.shape[:2])  # generated exposed
         ssims.append(M.ssim_rgb(gen, ref, data_range=255.0))
         psnrs.append(M.psnr(gen, ref, data_range=255.0))
+        L_gen, L_ref = _L_of(gen), _L_of(ref)
+        bf, wf = M.extreme_fraction(L_gen)
+        blacks.append(bf)
+        brights.append(wf)
+        dls.append(M.mean_delta_L(L_ref, L_gen))
     return {
         "n_src_pairs": len(stems),
         "ssim_src_mean": float(np.mean(ssims)),
         "ssim_src_std": float(np.std(ssims)),
         "psnr_src_mean": float(np.mean(psnrs)),
         "psnr_src_std": float(np.std(psnrs)),
+        "black_frac_mean": float(np.mean(blacks)),
+        "bright_frac_mean": float(np.mean(brights)),
+        "mean_delta_L_mean": float(np.mean(dls)),
     }
 
 
