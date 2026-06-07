@@ -85,6 +85,50 @@ def resize_L(arr: np.ndarray, hw) -> np.ndarray:
         (hw[1], hw[0]), Image.LANCZOS), dtype=np.float32)
 
 
+def checkpoint_candidates(cfg: dict, root: Path, domain_short: str, v: str,
+                          domain_long: str, override_root: str | None) -> list:
+    """Ordered list of plausible best.pt locations. The config's own
+    output.checkpoints_dir is authoritative (it's what the trainer wrote to)."""
+    cands = []
+    if override_root:
+        cands.append(Path(override_root) / domain_short / v / "checkpoints" / domain_long / "best.pt")
+    cd = (cfg.get("output", {}) or {}).get("checkpoints_dir")
+    if cd:
+        cands.append(Path(cd) / domain_long / "best.pt")
+        cands.append(Path(cd) / "best.pt")
+    cands.append(Path("outputs/ablations") / domain_short / v / "checkpoints" / domain_long / "best.pt")
+    cands.append(root / domain_short / v / "checkpoints" / domain_long / "best.pt")
+    return cands
+
+
+def resolve_checkpoint(cfg, root, domain_short, v, domain_long, override_root):
+    cands = checkpoint_candidates(cfg, root, domain_short, v, domain_long, override_root)
+    for c in cands:
+        if c.exists():
+            return c, cands
+    # last-resort recursive search under the config's output root
+    cd = (cfg.get("output", {}) or {}).get("checkpoints_dir")
+    for base in [Path(cd) if cd else None, Path("outputs/ablations"), root]:
+        if base and base.exists():
+            hits = [h for h in base.rglob("best.pt")
+                    if v in h.parts and domain_long in str(h)]
+            if hits:
+                return hits[0], cands
+    return None, cands
+
+
+def resolve_summary(cfg, root, domain_short, v) -> Path:
+    """Where to merge the _pp keys — prefer an existing summary.json so it lands
+    in the file aggregate_report will read."""
+    cand_cfg = Path((cfg.get("output", {}) or {}).get("root", "")) / "eval" / "summary.json" \
+        if (cfg.get("output", {}) or {}).get("root") else None
+    cand_root = root / domain_short / v / "eval" / "summary.json"
+    for c in (cand_cfg, cand_root):
+        if c and c.exists():
+            return c
+    return cand_root   # default: root-based, so `aggregate_report --root` finds it
+
+
 def find_gt(test_pairs_domain: Path, stem: str):
     for cand in (test_pairs_domain / f"{stem}.npy",
                  test_pairs_domain / f"{stem}_v0.npy"):
@@ -152,7 +196,10 @@ def main():
     ap.add_argument("--real_over", default=None)
     ap.add_argument("--hadepth_repo", default=None)
     ap.add_argument("--hadepth_ckpt", default=None)
-    ap.add_argument("--gen_subdir", default="eval/generated_pp")
+    ap.add_argument("--checkpoints_root", default=None,
+                    help="optional override for where checkpoints live "
+                         "(e.g. ./outputs/ablations). Normally auto-derived "
+                         "from each config's output.checkpoints_dir.")
     ap.add_argument("--max_images", type=int, default=None)
     args = ap.parse_args()
 
@@ -165,13 +212,21 @@ def main():
         real_dir = args.real_under if domain_short == "under" else args.real_over
         for v in APPLICABLE:
             cfg_path = configs_dir / domain_short / f"{v.lower()}.yaml"
-            ckpt = root / domain_short / v / "checkpoints" / domain_long / "best.pt"
-            summ_path = root / domain_short / v / "eval" / "summary.json"
-            if not cfg_path.exists() or not ckpt.exists():
-                print(f"[skip] {domain_short}/{v}: missing config or checkpoint")
+            if not cfg_path.exists():
+                print(f"[skip] {domain_short}/{v}: config not found at {cfg_path.resolve()}")
                 continue
-
             cfg = yaml.safe_load(open(cfg_path))
+
+            ckpt, cands = resolve_checkpoint(cfg, root, domain_short, v,
+                                             domain_long, args.checkpoints_root)
+            if ckpt is None:
+                print(f"[skip] {domain_short}/{v}: no best.pt found. checked:")
+                for c in cands:
+                    print(f"          {c}")
+                continue
+            summ_path = resolve_summary(cfg, root, domain_short, v)
+            print(f"[pp] {domain_short}/{v}: ckpt={ckpt}")
+
             use_depth = bool(cfg["model"].get("use_depth", True))
             target_mode = str(cfg["model"].get("target_mode", "l")).lower()
             if not (use_depth and target_mode == "l"):
@@ -183,7 +238,7 @@ def main():
             cfg2 = copy.deepcopy(cfg)
             cfg2["data"]["normal_dir"] = args.test_normal
 
-            gen_root = root / domain_short / v / args.gen_subdir
+            gen_root = summ_path.parent / "generated_pp"   # beside the summary
             print(f"\n[pp] {domain_short}/{v}: production inference → {gen_root}")
             run_inference(
                 cfg2, str(ckpt),
