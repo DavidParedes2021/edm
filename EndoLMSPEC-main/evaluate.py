@@ -92,6 +92,8 @@ def evaluate(epoch, net, net_D, dataloader, device, ps, loss_weights):
                     torch.pow(torch.sqrt(target_hist) - torch.sqrt(input_hist), 2)))) / input_hist.shape[0])
 
             # Generator loss with weighted losses:
+            if epsilon == 0:  # histogram loss disabled -> keep histo_loss defined
+                histo_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
             loss_generator = alpha * pyr_loss + beta * rec_loss + delta*histo_loss + epsilon * adv_loss
 
         val_loss_generator += loss_generator

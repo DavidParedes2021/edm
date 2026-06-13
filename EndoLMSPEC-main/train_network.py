@@ -176,7 +176,7 @@ def train_net(net,
 
                 rec_loss = mae_loss(y_pred['subnet_16'], G_pyramid['level1'])
 
-                if delta > 0:
+                if epsilon > 0:
                     input_hist = histogram_block(y_pred['subnet_16'])
                     target_hist = histogram_block(G_pyramid['level1'])
                     histo_loss = (1 / np.sqrt(2.0) * (torch.sqrt(torch.sum(
