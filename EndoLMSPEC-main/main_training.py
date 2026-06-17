@@ -1,6 +1,8 @@
 # Main script for training.
 import argparse
 import sys
+import traceback
+from datetime import datetime
 from train_network import *
 from losses.discriminator import Discriminator
 from generator import Generator
@@ -140,3 +142,21 @@ for ps in patch_sizes:
         torch.save(net_D.state_dict(), 'D_INTERRUPTED_{}.pth'.format(ps))
         logging.info('Saved interrupt')
         sys.exit(0)
+
+    except Exception:
+        # Any unexpected failure (OOM, bad data, disk full, ...) is written to a
+        # txt file next to the checkpoints so the cause survives even if the
+        # console scrollback is lost. Then re-raise so run_all.sh still aborts.
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        log_path = os.path.join(checkpoint_dir, 'error_log_P{}.txt'.format(ps))
+        tb = traceback.format_exc()
+        with open(log_path, 'w') as f:
+            f.write('Training FAILED at {}\n'.format(datetime.now().isoformat()))
+            f.write('exposure_dataset: {}\n'.format(dataset_dir))
+            f.write('checkpoint_dir:   {}\n'.format(checkpoint_dir))
+            f.write('patch_size (ps):  {}\n'.format(ps))
+            f.write('device:           {}\n'.format(device))
+            f.write('\n' + tb)
+        logging.error('Training failed at ps=%d; traceback written to %s', ps, log_path)
+        print(tb)
+        raise

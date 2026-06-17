@@ -69,11 +69,24 @@ python prepare_data.py --name endo4ie --exposure under \
 
 # ============================================================ 2-3. PATCHES + TRAIN
 TAGS=(mine_over endo4ie_over mine_under endo4ie_under)
+have_files() { [ -d "$1" ] && [ "$(find "$1" -maxdepth 1 -type f | wc -l)" -gt 0 ]; }
 for tag in "${TAGS[@]}"; do
     tree="$DATA/$tag"
+    model="$CKPT/$tag/main_net/model_256.pth"
+
+    # resume: skip a tag that is already fully trained
+    if [ -f "$model" ]; then
+        echo -e "\n[skip] $tag already trained -> $model"
+        continue
+    fi
+
     echo -e "\n=== STEP 2: patches for $tag ==="
     cd "$LMSPEC"
-    python patches_extraction.py --exposure_dataset "$tree" --patches_size_pow 7 8
+    if have_files "$tree/training/exp_images_PS256"; then
+        echo "[skip] patches for $tag already extracted"
+    else
+        python patches_extraction.py --exposure_dataset "$tree" --patches_size_pow 7 8
+    fi
 
     echo -e "\n=== STEP 3: train $tag ==="
     python main_training.py --exposure_dataset "$tree" \
