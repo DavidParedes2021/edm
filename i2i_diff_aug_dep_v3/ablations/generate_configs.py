@@ -58,11 +58,49 @@ def _v_no_sobel(cfg):
     cfg["losses"]["edge_weight"] = 0.0
 
 
+# ── Loss-composition ablation (all keep depth in the UNet + L-only target;
+#    the ONLY thing that varies is the loss weights, mse_weight stays 1.0) ─────
+def _v_vanilla_ddpm(cfg):
+    # Pure epsilon-MSE DDPM: every auxiliary x0-space loss switched off.
+    # Depth conditioning is intentionally KEPT — this ablation isolates the
+    # loss additions, not the depth input (that is the separate NO_DEPTH study).
+    _v_baseline(cfg)                       # depth on, L-only target (explicit)
+    cfg["losses"]["l1_weight"] = 0.0
+    cfg["losses"]["edge_weight"] = 0.0
+    cfg["losses"]["extreme_weight"] = 0.0
+    cfg["losses"]["depth_grad_weight"] = 0.0
+
+
+def _v_no_l1(cfg):
+    # Leave-one-out on the plain L1 reconstruction term.
+    _v_baseline(cfg)
+    cfg["losses"]["l1_weight"] = 0.0
+
+
+def _v_no_extreme(cfg):
+    # Leave-one-out on the extreme-weighted L1 (the mean-regression fix).
+    # Expect the effect strength (delta_L_mask) to drop most here.
+    _v_baseline(cfg)
+    cfg["losses"]["extreme_weight"] = 0.0
+
+
+def _v_no_dgrad(cfg):
+    # Leave-one-out on depth-gradient consistency.
+    # Expect depth_mask_pearson (effect placement vs geometry) to drop.
+    _v_baseline(cfg)
+    cfg["losses"]["depth_grad_weight"] = 0.0
+
+
 VARIANTS = {
     "BASELINE": _v_baseline,
     "NO_DEPTH": _v_no_depth,
     "LAB_FULL": _v_lab_full,
     "NO_SOBEL": _v_no_sobel,
+    # loss-composition study (6 variants: BASELINE + NO_SOBEL above, plus these)
+    "VANILLA_DDPM": _v_vanilla_ddpm,
+    "NO_L1": _v_no_l1,
+    "NO_EXTREME": _v_no_extreme,
+    "NO_DGRAD": _v_no_dgrad,
 }
 
 

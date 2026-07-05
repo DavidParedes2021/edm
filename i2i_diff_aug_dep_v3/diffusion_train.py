@@ -84,6 +84,27 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _atomic_torch_save(obj, path) -> None:
+    """Write a checkpoint atomically: serialise to a temp file on the same
+    filesystem, then os.replace() it into place. If the disk fills up mid-write
+    the exception fires while writing the .tmp file, leaving the previous
+    checkpoint intact — so an interrupted run can always resume from it.
+    """
+    path = str(path)
+    tmp = path + ".tmp"
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)          # atomic on the same filesystem
+    except Exception:
+        # Best-effort cleanup of a partial temp file; re-raise the real error.
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
+
+
 class EMAModel:
     def __init__(self, model, decay=0.9999):
         self.decay = decay
@@ -857,11 +878,11 @@ def train(cfg: dict, resume_path: str = None,
             "best_loss": best_loss,
             "config": cfg,
         }
-        torch.save(ck, str(ckpt_dir / "latest.pt"))
+        _atomic_torch_save(ck, str(ckpt_dir / "latest.pt"))
         if avg < best_loss:
             best_loss = avg
             ck["best_loss"] = best_loss
-            torch.save(ck, str(ckpt_dir / "best.pt"))
+            _atomic_torch_save(ck, str(ckpt_dir / "best.pt"))
             print(f"  → best model saved (loss={best_loss:.5f})")
 
         # periodic samples — only when running the baseline (L-only + depth)
@@ -891,6 +912,12 @@ def train(cfg: dict, resume_path: str = None,
             )
             model.load_state_dict(orig_sd)
             print(f"  → samples saved to {samp_dir}")
+
+    # Completion sentinel — a resumable runner checks for this to decide
+    # whether a variant is truly finished (best.pt/latest.pt exist from epoch 1
+    # onward and are NOT reliable "done" signals). Written only after the full
+    # epoch loop, so its presence means all `epochs` completed.
+    (ckpt_dir / "COMPLETED").write_text(f"epochs={epochs}\n", encoding="utf-8")
 
     print("[Train] complete.")
     if use_wandb:
