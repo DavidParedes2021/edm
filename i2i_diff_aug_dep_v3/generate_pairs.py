@@ -61,9 +61,12 @@ def generate_pairs(
     strength: float = 1.0,
     shift_magnitude_over: float = 65.0,
     shift_magnitude_under: float = 80.0,
-    gamma_over: float = 1.5,
-    gamma_under: float = 2.0,
+    gamma_over: float = 2.0,
+    gamma_under: float = 2.5,
     depth_blend: float = 1.0,
+    mask_strategy: str = "luminance",
+    hybrid_blend: float = 0.5,
+    vignette_threshold: float = 5.0,
     num_variants: int = 1,
     seed: int = 42,
 ):
@@ -123,12 +126,18 @@ def generate_pairs(
             suffix = f"_v{v}" if num_variants > 1 else ""
             stem = fpath.stem + suffix
 
+            common = dict(
+                mask_strategy=mask_strategy,
+                hybrid_blend=hybrid_blend,
+                vignette_threshold=vignette_threshold,
+            )
+
             # ── overexposed ──
             over_rgb = depth_aware_augment(
                 img_rgb, depth,
                 mode="overexposed",
                 shift_magnitude=shift_magnitude_over,
-                **params,
+                **params, **common,
             )
             over_lab = rgb_to_lab(over_rgb)
             np.save(str(out / "overexposed" / f"{stem}.npy"),
@@ -139,7 +148,7 @@ def generate_pairs(
                 img_rgb, depth,
                 mode="underexposed",
                 shift_magnitude=shift_magnitude_under,
-                **params,
+                **params, **common,
             )
             under_lab = rgb_to_lab(under_rgb)
             np.save(str(out / "underexposed" / f"{stem}.npy"),
@@ -159,9 +168,22 @@ def main():
     parser.add_argument("--strength", type=float, default=1.0)
     parser.add_argument("--shift_magnitude_over",  type=float, default=65.0)
     parser.add_argument("--shift_magnitude_under", type=float, default=80.0)
-    parser.add_argument("--gamma_over",  type=float, default=1.5)
-    parser.add_argument("--gamma_under", type=float, default=2.0)
-    parser.add_argument("--depth_blend", type=float, default=1.0)
+    parser.add_argument("--gamma_over",  type=float, default=2.0,
+                        help="Higher = sharper peak on bright pixels (over).")
+    parser.add_argument("--gamma_under", type=float, default=2.5,
+                        help="Higher = sharper peak on dark pixels (under).")
+    parser.add_argument("--depth_blend", type=float, default=1.0,
+                        help="Used only when --mask_strategy=depth: depth vs cluster mix.")
+    parser.add_argument("--mask_strategy", type=str, default="luminance",
+                        choices=["luminance", "depth", "hybrid"],
+                        help="luminance: use L itself as the cavity/foreground indicator "
+                             "(default; robust for endoscopy). depth: use depth_estimator output. "
+                             "hybrid: weighted blend of both.")
+    parser.add_argument("--hybrid_blend", type=float, default=0.5,
+                        help="Used only when --mask_strategy=hybrid: weight on luminance vs depth.")
+    parser.add_argument("--vignette_threshold", type=float, default=5.0,
+                        help="L threshold (0-100) below which a pixel is treated as camera "
+                             "vignette and excluded from all augmentation masks.")
     parser.add_argument("--num_variants", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -176,6 +198,9 @@ def main():
         gamma_over=args.gamma_over,
         gamma_under=args.gamma_under,
         depth_blend=args.depth_blend,
+        mask_strategy=args.mask_strategy,
+        hybrid_blend=args.hybrid_blend,
+        vignette_threshold=args.vignette_threshold,
         num_variants=args.num_variants,
         seed=args.seed,
     )
