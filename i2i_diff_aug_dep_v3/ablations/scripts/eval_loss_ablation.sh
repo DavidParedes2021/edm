@@ -72,6 +72,7 @@ done
 echo "[aggregate] writing comparison report"
 python -m ablations.aggregate_report \
   --root "$ABL_ROOT" \
+  --variants "$(IFS=,; echo "${VARIANTS[*]}")" \
   --out_md  ablations/RESULTS_loss.md \
   --out_csv ablations/RESULTS_loss.csv \
   2>&1 | tee "$ABL_ROOT/logs/aggregate_loss.log"

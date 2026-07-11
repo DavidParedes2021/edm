@@ -46,15 +46,15 @@ METRIC_ORDER = [
     ("black_frac_pp_mean",     "Black%_pp"),
 ]
 
-VARIANT_ORDER = ["BASELINE", "NO_DEPTH", "LAB_FULL", "NO_SOBEL"]
+DEFAULT_VARIANT_ORDER = ["BASELINE", "NO_DEPTH", "LAB_FULL", "NO_SOBEL"]
 
 
-def collect(root: Path) -> dict:
+def collect(root: Path, variant_order: list) -> dict:
     """Return {domain: {variant: summary_dict}}."""
     out = {}
     for domain in ("under", "over"):
         out[domain] = {}
-        for v in VARIANT_ORDER:
+        for v in variant_order:
             p = root / domain / v / "eval" / "summary.json"
             if p.exists():
                 with open(p) as f:
@@ -74,7 +74,7 @@ def fmt(v):
     return str(v)
 
 
-def markdown_table(data: dict) -> str:
+def markdown_table(data: dict, variant_order: list) -> str:
     lines = ["# Ablation results", ""]
     for domain_short, domain_long in (("under", "Underexposed"),
                                        ("over", "Overexposed")):
@@ -84,7 +84,7 @@ def markdown_table(data: dict) -> str:
         sep    = "|---|" + "|".join("---" for _ in METRIC_ORDER) + "|"
         lines.append(header)
         lines.append(sep)
-        for v in VARIANT_ORDER:
+        for v in variant_order:
             s = data[domain_short].get(v)
             if s is None:
                 row = [v] + ["—"] * len(METRIC_ORDER)
@@ -95,10 +95,10 @@ def markdown_table(data: dict) -> str:
     return "\n".join(lines)
 
 
-def csv_rows(data: dict) -> list:
+def csv_rows(data: dict, variant_order: list) -> list:
     rows = [["domain", "variant"] + [k for k, _ in METRIC_ORDER]]
     for domain in ("under", "over"):
-        for v in VARIANT_ORDER:
+        for v in variant_order:
             s = data[domain].get(v)
             if s is None:
                 rows.append([domain, v] + ["" for _ in METRIC_ORDER])
@@ -112,14 +112,23 @@ def main():
     ap.add_argument("--root", default="./outputs/ablations")
     ap.add_argument("--out_md",  default="ablations/RESULTS.md")
     ap.add_argument("--out_csv", default="ablations/RESULTS.csv")
+    ap.add_argument("--variants", default=None,
+                    help="Comma-separated variant order to report. "
+                         "Default = the depth/target study "
+                         f"({','.join(DEFAULT_VARIANT_ORDER)}).")
     args = ap.parse_args()
 
-    data = collect(Path(args.root))
-    md = markdown_table(data)
+    if args.variants:
+        variant_order = [v.strip() for v in args.variants.split(",") if v.strip()]
+    else:
+        variant_order = DEFAULT_VARIANT_ORDER
+
+    data = collect(Path(args.root), variant_order)
+    md = markdown_table(data, variant_order)
     with open(args.out_md, "w") as f:
         f.write(md)
     with open(args.out_csv, "w", newline="") as f:
-        csv.writer(f).writerows(csv_rows(data))
+        csv.writer(f).writerows(csv_rows(data, variant_order))
     print(f"[wrote] {args.out_md}")
     print(f"[wrote] {args.out_csv}")
     print()
