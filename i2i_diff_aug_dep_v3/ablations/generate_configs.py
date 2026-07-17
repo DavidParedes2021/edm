@@ -91,6 +91,20 @@ def _v_no_dgrad(cfg):
     cfg["losses"]["depth_grad_weight"] = 0.0
 
 
+def _v_no_l1_no_extreme(cfg):
+    # Confirmation variant for the OVERexposed domain (a 2-term removal the LOO
+    # study could not express). On over the LOO showed:
+    #   * extreme_weight HURTS realism (weights near-saturated bright pixels) —
+    #     removing it gave the best FID;
+    #   * l1_weight SUPPRESSES the brightening effect and also costs some FID —
+    #     removing it gave the strongest ΔL_mask.
+    # This keeps the two terms that DO help on over (Sobel + depth-grad) and
+    # drops both offenders, i.e. the hypothesised over-optimal recipe.
+    _v_baseline(cfg)
+    cfg["losses"]["l1_weight"] = 0.0
+    cfg["losses"]["extreme_weight"] = 0.0
+
+
 VARIANTS = {
     "BASELINE": _v_baseline,
     "NO_DEPTH": _v_no_depth,
@@ -101,6 +115,8 @@ VARIANTS = {
     "NO_L1": _v_no_l1,
     "NO_EXTREME": _v_no_extreme,
     "NO_DGRAD": _v_no_dgrad,
+    # over-domain confirmation (2-term removal, run with ONLY_DOMAIN=over)
+    "NO_L1_NO_EXTREME": _v_no_l1_no_extreme,
 }
 
 
