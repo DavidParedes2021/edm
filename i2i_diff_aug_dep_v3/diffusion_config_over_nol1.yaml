@@ -1,0 +1,308 @@
+# ============================================================
+# Depth-Aware Paired Luminance Diffusion — Config (split-domain)
+# ============================================================
+# Conditional DDPM on L channel, with depth conditioning.
+#   input  = concat(noisy_target_L, source_L, depth) → 3 channels
+#   output = predicted noise on target_L              → 1 channel
+#
+# A SINGLE model is trained per direction (overexposed OR underexposed).
+# Run training twice with `domain: overexposed` and `domain: underexposed`
+# to obtain two specialised checkpoints — this eliminates the leakage
+# failure mode where one image showed both effects, and lets each model
+# fully commit to its direction without a class embedding compromising
+# the backbone weights.
+#
+# One-time setup before training:
+#   python depth_estimator.py --input_dir <normal> --output_dir <depth>
+#   python generate_pairs.py  --normal_dir <normal> --depth_dir <depth> \
+#                             --output_dir <pairs> --num_variants 3
+#
+# Then train per domain:
+#   python diffusion_train.py --config diffusion_config.yaml \
+#       --domain underexposed --output_subdir under
+#   python diffusion_train.py --config diffusion_config.yaml \
+#       --domain overexposed  --output_subdir over
+
+# ============================================================
+# THE ONE KNOB FOR THIS RUN — flip this to switch directions.
+# ============================================================
+# 'underexposed' → train/infer the dark-cavity model.
+# 'overexposed'  → train/infer the bright-near-tissue model.
+#
+# Pairs are generated for BOTH directions in a single
+# `generate_pairs.py` run, so you don't have to regenerate
+# data when switching. Each direction saves its checkpoints
+# under  output.checkpoints_dir / <domain>/  automatically,
+# so the two trainings won't overwrite each other.
+#
+# CLI override: pass `--domain overexposed` or
+# `--domain underexposed` to either diffusion_train.py or
+# diffusion_inference.py to override this field for one run.
+domain: "overexposed"
+
+# ============================================================
+# OVER-DOMAIN LOSS RETRAIN — l1_weight = 0.0
+# ============================================================
+# Identical to diffusion_config.yaml in EVERY field except:
+#   * losses.l1_weight   0.1 → 0.0
+#   * output.*           new tree so the current over checkpoint survives
+#
+# Motivated by the loss-composition LOO study (ablations/RESULTS_loss.md,
+# 150-epoch runs on the ablation pairs). On the OVERexposed direction,
+# dropping the plain L1 term improved every metric that matters:
+#
+#   metric      BASELINE → NO_L1
+#   FID         107.82   → 99.97    (−7.9)
+#   KID         0.0351   → 0.0262
+#   LPIPS       0.1627   → 0.1524
+#   ΔL_mask     8.67     → 11.72    (+35% effect strength)
+#   depth-r     0.156    → 0.299    (+92% geometry alignment)
+#
+# The mechanism: L1 on x0_hat pulls the prediction toward the conditional
+# mean, which on the bright direction directly fights extreme_weight and
+# suppresses the brightening. On UNDERexposed the same removal is harmful
+# (FID 116.3 → 141.9), so under keeps l1_weight=0.1 — see
+# diffusion_config.yaml. The split-domain architecture is what makes this
+# asymmetric choice possible.
+#
+# NOT adopted: NO_L1_NO_EXTREME (dropping extreme too). It gave the
+# strongest ΔL_mask (12.57) but the effect stopped being localised
+# (meanΔL 11.08, ΔL_mask/meanΔL ratio 1.13 vs 1.53 here) and depth-r
+# collapsed back to 0.163 — a global exposure shift, not a depth-aware one.
+
+# --- Data paths ---
+data:
+  #pairs_dir: "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs"
+  #normal_dir: "../../../data/datasets/edm_consolidated_dataset/consolidated_classified_dataset/normal_frames"
+  #depth_dir:  "../../../projects/i2i_diff_aug_dep_v3/outputs/pairs/depth"
+  
+  #pairs_dir: "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs"
+  #normal_dir: "../../../data/datasets/kvasir_classified/none"
+  #depth_dir:  "../../../projects/i2i_diff_aug_dep_v3_sep/outputs/pairs/depth"
+  
+  pairs_dir: "../../../../projects/i2i_diff_hybrid_v1/outputs/pairs"
+  normal_dir: "../../../../data/datasets/kvasir_classified/none_filtered"
+
+  #normal_dir: "../../../../data/datasets/kvasir_classified/none"
+  depth_dir:  "../../../../projects/i2i_diff_hybrid_v1/outputs/pairs/depth"
+
+# --- Output paths ---
+# Each per-domain training run writes into a sub-directory of `root`
+# named after `domain` (overridable via --output_subdir).
+output:
+  root: "../../../../projects/i2i_diff_v3_over_nol1/outputs"
+  checkpoints_dir: "../../../../projects/i2i_diff_v3_over_nol1/outputs/checkpoints"
+  samples_dir: "../../../../projects/i2i_diff_v3_over_nol1/outputs/samples"
+
+# --- Image settings ---
+image:
+  size: 256
+
+# --- Model ---
+# 3 input channels: noisy target L + clean source L + depth
+# num_class_embeds is intentionally null — we train one specialised model
+# per direction, so there is no class to condition on. Forward calls pass
+# class_labels=None.
+model:
+  in_channels: 3
+  out_channels: 1
+  block_out_channels: [64, 128, 192, 256]
+  layers_per_block: 2
+  down_block_types:
+    - "DownBlock2D"
+    - "DownBlock2D"
+    - "DownBlock2D"
+    - "AttnDownBlock2D"
+  up_block_types:
+    - "AttnUpBlock2D"
+    - "UpBlock2D"
+    - "UpBlock2D"
+    - "UpBlock2D"
+  num_class_embeds: null
+  attention_head_dim: 16
+
+  # FiLM modulation on 4-D depth stats [mean, std, p10, p90] → time-embed.
+  # Last layer is zero-initialised so training starts identical to
+  # the no-FiLM baseline. Toggle on after a first successful run.
+  depth_film: false
+  depth_film_hidden: 64
+
+# --- Diffusion ---
+diffusion:
+  num_train_timesteps: 1000
+  beta_schedule: "squaredcos_cap_v2"
+  prediction_type: "epsilon"
+
+# --- Training ---
+training:
+  epochs: 300
+  batch_size: 4
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  grad_accum_steps: 1
+  mixed_precision: true
+  ema_decay: 0.9999
+  num_workers: 4
+  save_every_n_epochs: 10
+  patience: 50
+
+  # Robustness augmentations.
+  gamma_jitter: 0.1
+  depth_noise_sigma: 0.05   # bumped — stress-test against depth-estimator error
+
+# --- Losses ---
+losses:
+  mse_weight: 1.0
+  l1_weight: 0.0      # ← the change (was 0.1); see header
+  edge_weight: 0.03
+
+  # Extreme-weighted L1 — single knob; the loss automatically uses
+  # mode='dark' if domain='underexposed', mode='bright' if 'overexposed'.
+  # Heavily upweights pixels at the target's extreme to crush the
+  # mean-regression bias responsible for "barely noticeable" effects.
+  extreme_weight: 0.5     # was dark_weight=0.15
+  extreme_alpha:  8.0       # was 3.0
+  extreme_tau:    0.3
+
+  # Depth-gradient consistency — keeps exposure falloff aligned with geometry.
+  depth_grad_weight: 0.05
+  dgrad_margin:      0.1
+
+  # SNR gating for x0-space aux losses. Bumped to 0.75 so the dark/bright
+  # signal reaches a larger fraction of timesteps without triggering the
+  # high-t fp16-instability.
+  aux_max_t_frac: 0.75
+
+# --- Chroma attenuation (post-hoc, non-learned) ---
+# Two symmetric tweaks:
+#   • Dark side (under): sat_floor pushed near zero and depth_chroma_boost
+#     increased so deep tissue reads as near-monochrome. Without this the
+#     residual warm AB on a darkened L renders as brown/gray, not black.
+#   • Bright side (over): highlight_knee lowered from 90 → 78 and
+#     highlight_desat raised from 0.60 → 0.80 so over-bright tissue reads
+#     as blown-out white, not "warm bright". Mirror of the dark fix.
+chroma:
+  sat_knee:           5.0
+  sat_full:          40.0
+  sat_floor:          0.05
+  depth_chroma_boost: 0.45
+  highlight_desat:    0.80
+  highlight_knee:    78.0
+  purkinje_b_shift:   2.0
+  purkinje_threshold: 25.0
+
+# --- Texture-gate post-process (recombination) ---
+# Attenuates the original high-frequency texture in regions where the
+# predicted L_low is at an extreme. Without this, re-adding L_high_orig
+# brings mid-tone variance back into the deepest cores and undoes the
+# darkening / brightening — the dominant cause of "weak" effects.
+texture_gate:
+  knee:  30.0   # ramp width in L units
+  floor: 0.05   # min HF multiplier in deepest extreme
+
+# --- Content mask (UI / letterbox passthrough) ---
+# Endoscopy frames have UI panels and circular FOV masks. The model has
+# no useful conditioning on those pure-black regions and outputs noise
+# there. We detect the valid scene area from the original RGB and force
+# everything outside it to the original pixels.
+content_mask:
+  enable:         true
+  luma_threshold: 8.0   # Rec.601 luma below which a pixel is 'border'
+  erode_iter:     2     # erode the boundary slightly to avoid edge bleed
+
+# --- Focal blend (force underexposure to stay in deep zones only) ---
+# Even inside the FOV the model can leak the effect onto mid-depth tissue
+# near the light source. A depth-driven blend weight lets the model fully
+# act only in the deepest regions and falls off to the original L
+# elsewhere. alpha(d) = ((farness - knee) / (1 - knee))^gamma in [floor, 1].
+#
+# gamma was lowered (2.5 → 1.6) and knee → 0 so the dark zone covers the
+# whole depth-far half of the FOV instead of collapsing onto a tight ring
+# around the deepest pixel. Combined with `analytic_floor` below, the
+# darkening reaches L≈0 in the cavity AND extends across a believable area.
+focal_blend:
+  enable:       true
+  gamma:        1.6   # lower = wider effect zone
+  knee:         0.0   # no dead-zone — even the slightly-far tissue darkens
+  floor:        0.0   # min α; 0 = fully suppress effect on near tissue
+  smooth_sigma: 4.0   # gaussian smoothing of α (px at 512px ref)
+  # Model-trust boost on α: where the model's predicted L diverges from
+  # L_orig in the domain's direction, raise α toward 1 regardless of
+  # depth. Fixes "barely darkened" outputs on flat scenes (no clear deep
+  # cavity) where depth alone keeps α≈floor and the original brighter
+  # L wins. Set to 0 to disable; 1 = fully trust the model wherever it
+  # commits to a strong shift. The deep-cavity behavior is unchanged
+  # because α is already 1 there.
+  model_trust:      0.9   # 0..1; weight given to model's strength signal
+  model_strength_L: 80.0   # L-unit delta treated as "full strength"
+
+# --- Predicted-L localization (confine the effect to the target band) ---
+# Confine the effect to one continuous region in the predicted-L extreme
+# (top ~20% for over, bottom ~20% for under). Outside the region we keep
+# the original L AND AB exactly — no cloudy mid-tone bleed.
+#
+# Pipeline:
+#   1. Pre-smooth predicted L (sigma = max(H,W) / presmooth_ref). This is
+#      what stops the mask from becoming a constellation of isolated
+#      stains: the percentile band is computed on a low-passed map, so it
+#      picks up the large-scale bright/dark structure the model committed
+#      to, not per-pixel noise.
+#   2. Smoothstep over the band → soft weight.
+#   3. If `largest_only`, binarize at 0.5 inside the content mask, fill
+#      holes, label connected components, keep ONLY the largest blob.
+#      Guarantees a single continuous region.
+#   4. Final Gaussian blur on the weight (sigma = max(H,W) / smooth_ref)
+#      for soft edges where the region meets untouched pixels.
+l_localize:
+  enable:              true
+  band_low_pct_under:  19.0   # below this percentile → full weight (under)
+  band_high_pct_under: 35.0   # above this percentile → zero weight (under)
+  band_low_pct_over:   70.0   # below this percentile → zero weight (over)
+  band_high_pct_over:  90.0   # above this percentile → full weight (over)
+  presmooth_ref:       24.0   # pre-smooth sigma divisor (lower = heavier blur of L_pred)
+  smooth_ref:          48.0   # final weight-map blur sigma divisor (lower = softer edges)
+  largest_only:        true   # keep only the single largest connected blob
+  # In-mask soft level shift: applied AFTER texture reinjection. We
+  # measure the mask-core 10th (under) / 90th (over) percentile of
+  # L_model and additively shift L_model inside w_loc so that extreme
+  # reaches the target. A uniform shift preserves the natural gradient
+  # and HF detail the texture reinjection just baked in, so the region
+  # reads as part of the scene instead of a flat patch stamped on top.
+  # If the model already commits past the target, the shift is zero —
+  # this is a floor, not a clamp, so strong predictions are never weakened.
+  # Lower target_L_over (e.g. 90) or raise target_L_under (e.g. 10) for a
+  # softer guaranteed effect; set enforce_target: false to disable.
+  enforce_target:      true
+  target_L_over:       95.0
+  target_L_under:      95.0
+
+# --- Analytic floor (definitive strength clamp on the model output) ---
+# DDPMs trained with MSE/L1 + extreme-weighted L1 still regress toward the
+# conditional mean — the predicted L in the deep cavity ends up around
+# 40–55 instead of the 0–10 the synthetic training targets actually hit.
+# `depth_aware_augment_lab` is the function that produced those targets;
+# we run it at inference with strong parameters and clamp the model's L
+# against it (np.minimum for underexposed, np.maximum for overexposed).
+# The model can only DEEPEN the effect, never weaken it. This is the fix
+# for "looks just grayed instead of dark".
+analytic_floor:
+  enable:                true
+  shift_magnitude_under: 2.0   # max L drop applied in deep cavity
+  shift_magnitude_over:  80.0   # max L lift applied near light source
+  gamma_under:           2    # lower = wider underexposure zone
+  gamma_over:            5
+  core_threshold:        0.5    # influence above which L is forced toward 0/100
+  core_clip_blend:       0.6   # 1.0 → pure black/white in core; 0.0 → no extra pull
+  hf_kill:               0.97   # fraction of original HF removed at peak influence
+  smooth_sigma_base:     10.0    # gaussian smoothing of depth mask (px at 512px ref)
+
+# --- Inference ---
+inference:
+  num_inference_steps: 50
+  batch_size: 1
+
+# --- Logging ---
+logging:
+  use_wandb: false
+  wandb_project: "depth-aware-exposure-diffusion"
+  wandb_entity: null
